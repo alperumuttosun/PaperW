@@ -11,6 +11,7 @@
 # Step 7  Null model 2 (degree-preserving topology randomization)
 # Step 8  Diagnostics: pair-count audit, prevalence by R, XGB/LASSO dispersion, yield skew
 # Step 9  Figures 1 and 2
+# Step 10 OPTIONAL data check: where the GDP values come from (constant-US$ series, PPP fallback, interpolation)  [needs internet + WDI package; off by default]
 # -----------------------------------------------------------------------------
 # HOW TO USE: run the whole file. Heavy steps 1 and 5 are skipped automatically if
 # their output already exists; set RUN["step5"] <- FALSE below to skip Step 5 for now.
@@ -41,9 +42,9 @@ cat("Base folder:", base_dir, "\n")
 
 # ---- 2) Switches ----
 RUN <- c(step1 = TRUE, step2 = TRUE, step3 = TRUE, step4 = TRUE, step5 = TRUE,
-         step6 = TRUE, step7 = TRUE, step8 = TRUE, step9 = TRUE)           # set a step to FALSE to skip it
+         step6 = TRUE, step7 = TRUE, step8 = TRUE, step9 = TRUE, step10 = FALSE)          # set a step to FALSE to skip it (Step 10 is an optional check, off by default)
 SKIP_IF_DONE <- c(step1 = TRUE, step5 = TRUE)                              # heavy steps: skip if output already exists
-RUN_ORDER <- c(1, 2, 3, 4, 6, 7, 8, 9, 5)                                  # fast steps first, heavy Step 5 last
+RUN_ORDER <- c(1, 2, 3, 4, 6, 7, 8, 9, 10, 5)                                  # fast steps first, heavy Step 5 last
 
 # ---- 3) Design parameters (same as the main paper) ----
 crops      <- c("wheat", "barley", "oats", "rye", "rice", "maize", "soybean", "sorghum")
@@ -479,6 +480,91 @@ step9 <- function() {
 }
 
 # =============================================================================
+# STEP 10 -- GDP source audit: which WDI series each GDP value in the panels came from
+# (re-creates the GDP construction of the panel-building script and flags every value;
+#  needs internet and the WDI package; if either is missing the step is skipped)
+# =============================================================================
+wdi_pull <- function(indicator) {                                          # one WDI download, same call as in the panel-building script
+  WDI::WDI(indicator = indicator, country = "all", start = 1961, end = 2024, extra = TRUE)
+}
+
+step10 <- function() {
+  if (!requireNamespace("WDI", quietly = TRUE)) {                          # WDI package is needed only for this step
+    cat("Step 10 skipped: run install.packages('WDI') first\n"); return(invisible())
+  }
+  drop_aggregates <- function(x) x[!is.na(x$iso3c) & x$iso3c != "" &      # keep real countries only (regional aggregates removed)
+                                     (is.na(x$region) | x$region != "Aggregates"), ]
+  iso_fix <- c(ROM = "ROU", ZAR = "COD", TMP = "TLS", YUG = "SRB", CSK = "CZE")  # ISO recoding the panel script applied to the KD series
+
+  # (a) constant 2015 US$ per capita = primary source ("KD")
+  kd_raw <- drop_aggregates(wdi_pull("NY.GDP.PCAP.KD"))
+  kd <- data.frame(Country_ISO = dplyr::recode(kd_raw$iso3c, !!!iso_fix),  # recode old ISO codes
+                   Yil = as.integer(kd_raw$year),
+                   gdp_kd = as.numeric(kd_raw$NY.GDP.PCAP.KD)) %>%
+    filter(!is.na(gdp_kd), Yil >= 1961, Yil <= 2024) %>%                   # keep non-missing values in the panel window
+    group_by(Country_ISO, Yil) %>% summarise(gdp_kd = mean(gdp_kd), .groups = "drop")  # one value per country-year
+
+  # (b) PPP constant international $ per capita = fallback source ("PPP")
+  ppp_raw <- drop_aggregates(wdi_pull("NY.GDP.PCAP.PP.KD"))
+  ppp <- data.frame(Country_ISO = ppp_raw$iso3c, Yil = as.integer(ppp_raw$year),
+                    gdp_ppp = as.numeric(ppp_raw$NY.GDP.PCAP.PP.KD)) %>%
+    filter(!is.na(gdp_ppp), Yil >= 1961, Yil <= 2024) %>%
+    group_by(Country_ISO, Yil) %>% summarise(gdp_ppp = mean(gdp_ppp), .groups = "drop")
+
+  # (c) combine: KD first, PPP only where KD is missing (no rescaling), and remember the source
+  gdp <- full_join(kd, ppp, by = c("Country_ISO", "Yil")) %>%
+    mutate(gdp = coalesce(gdp_kd, gdp_ppp),
+           source = case_when(!is.na(gdp_kd) ~ "KD", !is.na(gdp_ppp) ~ "PPP", TRUE ~ NA_character_)) %>%
+    filter(!is.na(gdp))
+
+  # (d) linear interpolation between observed years inside each country (rule = 1: no extrapolation)
+  full <- expand.grid(Country_ISO = unique(gdp$Country_ISO), Yil = 1961:2024, stringsAsFactors = FALSE) %>%
+    left_join(gdp %>% select(Country_ISO, Yil, gdp, source), by = c("Country_ISO", "Yil")) %>%
+    group_by(Country_ISO) %>%
+    mutate(n_obs = sum(!is.na(gdp)),                                       # number of real observations for this country
+           gdp_final = if (n_obs[1] >= 2) approx(Yil[!is.na(gdp)], gdp[!is.na(gdp)], xout = Yil, rule = 1)$y else gdp,
+           source = ifelse(is.na(gdp) & !is.na(gdp_final), "interpolated", source)) %>%  # filled values are labelled
+    ungroup() %>% filter(!is.na(gdp_final))
+
+  # (e) attach the source label to every country-year of every crop panel and tabulate
+  count_sources <- function(d, crop_label, subset_label) {                 # one summary row per crop x subset
+    n <- nrow(d)
+    data.frame(crop = crop_label, subset = subset_label, n_rows = n,
+               n_KD = sum(d$source == "KD"), n_PPP = sum(d$source == "PPP"),
+               n_interpolated = sum(d$source == "interpolated"), n_unmatched = sum(d$source == "unmatched"),
+               pct_PPP = 100 * mean(d$source == "PPP"), pct_interpolated = 100 * mean(d$source == "interpolated"),
+               pct_unmatched = 100 * mean(d$source == "unmatched"))
+  }
+  rows_out <- list(); pooled <- list()
+  for (crop_name in crops) {
+    p <- read_panel(crop_name) %>% select(Country_ISO, Yil, GDP_per_Capita)
+    p <- p %>% left_join(count(p, Country_ISO, name = "n_rows"), by = "Country_ISO") %>%
+      mutate(eligible = n_rows >= min_obs) %>%                             # same eligibility rule as the network analysis
+      left_join(full %>% select(Country_ISO, Yil, gdp_final, source), by = c("Country_ISO", "Yil")) %>%
+      filter(!is.na(GDP_per_Capita)) %>%                                   # only rows that actually carry a GDP value
+      mutate(matches = !is.na(gdp_final) & abs(GDP_per_Capita - gdp_final) <= 1e-6 * abs(GDP_per_Capita),
+             source = ifelse(matches, source, "unmatched"))                # unmatched = panel value not reproduced (e.g. newer WDI vintage)
+    pooled[[crop_name]] <- p %>% mutate(crop = crop_name)
+    rows_out[[length(rows_out) + 1]] <- count_sources(p, crop_name, "all rows")
+    rows_out[[length(rows_out) + 1]] <- count_sources(p %>% filter(eligible), crop_name, "eligible countries")
+  }
+  pooled <- bind_rows(pooled)
+  rows_out[[length(rows_out) + 1]] <- count_sources(pooled, "ALL CROPS", "all rows")
+  rows_out[[length(rows_out) + 1]] <- count_sources(pooled %>% filter(eligible), "ALL CROPS", "eligible countries")
+  summary_tbl <- bind_rows(rows_out)
+
+  ppp_countries <- pooled %>% distinct(Country_ISO, Yil, source) %>%      # unique country-years that used the PPP fallback
+    filter(source == "PPP") %>% group_by(Country_ISO) %>%
+    summarise(n_country_years_PPP = n(), first_year = min(Yil), last_year = max(Yil), .groups = "drop") %>%
+    arrange(desc(n_country_years_PPP))
+
+  write_xlsx(list(summary = summary_tbl, ppp_countries = ppp_countries), out_file("networkstep10_output.xlsx"))
+  print(summary_tbl); print(ppp_countries)
+  cat("\nIf pct_unmatched is large, the live WDI data differ from the vintage used to build the panels;\n",
+      "in that case send networkstep10_output.xlsx anyway and say when the panels were built.\n")
+}
+
+# =============================================================================
 # DRIVER
 # =============================================================================
 t_all <- Sys.time()
@@ -487,8 +573,6 @@ for (s in RUN_ORDER) if (RUN[paste0("step", s)]) {
   get(paste0("step", s))()                                                 # call step1() ... step9()
 }
 cat("\nPIPELINE FINISHED in", round(as.numeric(difftime(Sys.time(), t_all, units = "mins")), 1), "minutes\n")
-
-
 
 
 
