@@ -487,3 +487,2894 @@ for (s in RUN_ORDER) if (RUN[paste0("step", s)]) {
   get(paste0("step", s))()                                                 # call step1() ... step9()
 }
 cat("\nPIPELINE FINISHED in", round(as.numeric(difftime(Sys.time(), t_all, units = "mins")), 1), "minutes\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# The code below is only to download and create the data, which is given in "data file".
+# It will take time, so it is not recommended.
+
+# ==============================================================================
+# STEP 00: DATA PREPARATION PIPELINE
+# Global multi-crop panel: annual climate variables + FAOSTAT yield data
+#
+# Pipeline overview:
+#   Step 1 : CRU TS4.09 + CROPGRIDS -> monthly climate panel     -> panelv1_*
+#   Step 2 : Annual aggregation + FAO yield/CO2/GDP join + filters -> panelv2_*
+#   Step 3 : Extra countries patch (IRN, EGY, NGA, SDN)          -> panelv3_*
+#   Step 4 : FAOSTAT irrigation data                             -> panelv4_*
+#   Step 5 : Cropland area + irr_ratio                           -> panelv5_*
+#   Step 6 : Aridity Index (year-varying AI/is_arid AND fixed    -> panelv6_*
+#            AI_baseline/is_arid_fixed, both AI = PRE_ann/PET_ann)
+#   Step 7 : GDP per capita (WDI, backfill fix) + fixed-baseline      -> panelv7_* (final)
+#            weighting columns
+#            baseline production/area weights
+#
+# Notes on scope:
+#   - No phenology windows. All climate variables are ANNUAL means/sums.
+#   - No VPD. Vapour pressure (VAP_ann) is retained only as a general
+#     climate control variable, not converted into VPD anywhere.
+#   - Aridity is defined using the UNEP (1997) Aridity Index (AI = P/PET),
+#     not a raw precipitation threshold. is_arid = 1 if AI < 0.50 (semi-arid
+#     and drier). PET data quality is checked explicitly before use.
+#   - Two aridity variables exist: AI/is_arid (year-varying, this country's
+#     own year) and AI_baseline/is_arid_fixed (time-invariant, from the
+#     1990-2000 baseline window or a documented fallback). The fixed
+#     version is what the fixed-aridity interaction specification (is_arid_fixed
+#     x TMX) uses, so that it measures structural aridity rather than
+#     duplicating the within-year precipitation x TMX interaction. The
+#     fixed-baseline production/area weights (baseline_production_tonnes,
+#     baseline_area_harvested_ha) are computed in Step 7 using the same
+#     1990-2000-or-fallback window as the fixed aridity classification --
+#     one consistent design for every non-contemporaneous, fixed country
+#     characteristic in the pipeline.
+#
+# Input files (all in base_dir):
+#   CRU_TS4.09_*.nc                          -- CRU TS4.09 monthly climate grids
+#   CROPGRIDSv1.08_*.nc                      -- CROPGRIDS crop-specific area rasters (circa 2020)
+#   Production_Crops_Livestock_E_All_Data_(Normalized).csv -- FAOSTAT
+#   GLOBAL_ATMOSPHERIC_CO2_NOAA.csv
+#   gdp_per_person.csv                       -- fallback GDP (overridden by WDI in Step 7)
+#   FAOSTAT_data_en_3-5-2026.xls             -- FAOSTAT irrigation data
+#   sudanvs.xls                              -- FAO data for IRN/EGY/NGA/SDN
+#
+# Country list: derived directly from FAOSTAT (no separate country-list file).
+# A country enters the panel if FAOSTAT records Production or Yield for at
+# least one of the eight target crops, 1961-2024, excluding regional
+# aggregates. This avoids depending on any previously self-generated file.
+#
+# Output files: panelv7_wheat.xlsx ... panelv7_sorghum.xlsx
+#
+# Required packages:
+#   install.packages(c("terra","geodata","dplyr","readxl","writexl",
+#                      "data.table","tidyr","zoo","rnaturalearth",
+#                      "rnaturalearthdata","sf","WDI"))
+# ==============================================================================
+
+
+# ==============================================================================
+# 0. SETUP -- packages and path configuration
+# ==============================================================================
+
+# Load terra before dplyr to avoid select() conflicts
+library(terra)
+library(geodata)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(data.table)
+library(tidyr)
+library(zoo)
+
+# Base directory -- adjust if running on a different machine
+base_dir     <- "C:/Users/Alper.Tosun/Desktop/cru130"
+climate_dir  <- file.path(base_dir, "cru-iklim-veri")       # CRU .nc files
+cropgrids_dir <- file.path(base_dir, "cropgrids", "22491997",
+                           "CROPGRIDSv1.08_NC_maps", "CROPGRIDSv1.08_NC_maps")
+fao_csv      <- file.path(base_dir,
+                          "Production_Crops_Livestock_E_All_Data_(Normalized).csv")
+co2_csv      <- file.path(base_dir, "GLOBAL_ATMOSPHERIC_CO2_NOAA.csv")
+gdp_csv      <- file.path(base_dir, "gdp_per_person.csv")
+irrigation_xl <- file.path(base_dir, "FAOSTAT_data_en_3-5-2026.xls")
+extra_countries_xls <- file.path(base_dir, "sudanvs.xls")
+
+setwd(base_dir)
+
+
+# ==============================================================================
+# 1. CROP CONFIGURATION -- CROPGRIDS crop key and FAO item names
+#
+# Area weights come from CROPGRIDS (Tang et al. 2024, Scientific Data),
+# a single fixed cross-section circa 2020, 0.05 deg resolution, 173 crops.
+# Each of the 8 crops here has its OWN dedicated CROPGRIDS layer -- unlike
+# a coarser shared-raster approach, wheat's raster is never reused for
+# barley, oats, or rye, ensuring genuine crop-specific area weighting
+# for every crop in the panel.
+#
+# `cropgrids` gives the crop's short name as used in CROPGRIDS file/variable
+# naming. VERIFY this against the actual downloaded CROPGRIDS files before
+# running -- see cropgrids_file() / load_cropgrids_harvarea() below.
+# ==============================================================================
+
+crop_config <- list(
+  wheat   = list(cropgrids = "wheat",   p1 = "panelv1_wheat",
+                 fao  = c("Wheat")),
+  barley  = list(cropgrids = "barley",  p1 = "panelv1_barley",
+                 fao  = c("Barley")),
+  oats    = list(cropgrids = "oats",    p1 = "panelv1_oats",
+                 fao  = c("Oats")),
+  rye     = list(cropgrids = "rye",     p1 = "panelv1_rye",
+                 fao  = c("Rye")),
+  rice    = list(cropgrids = "rice",    p1 = "panelv1_rice",
+                 fao  = c("Rice, paddy", "Rice")),
+  maize   = list(cropgrids = "maize",   p1 = "panelv1_maize",
+                 fao  = c("Maize (corn)", "Maize")),
+  soybean = list(cropgrids = "soybean", p1 = "panelv1_soybean",
+                 fao  = c("Soya beans", "Soybeans")),
+  sorghum = list(cropgrids = "sorghum", p1 = "panelv1_sorghum",
+                 fao  = c("Sorghum"))
+)
+
+
+# ==============================================================================
+# 2. CRU VARIABLE LIST -- file names and scale flags
+#    CRU stores tmp/tmn/tmx/dtr/vap as INT16 x 0.1 -> check mean > 100
+# ==============================================================================
+
+cru_var_info <- list(
+  tmp = list(nc = "CRU_TS4.09_tmp_1961_2024.nc", scale = TRUE),
+  pre = list(nc = "CRU_TS4.09_pre_1961_2024.nc", scale = FALSE),
+  tmn = list(nc = "CRU_TS4.09_tmn_1961_2024.nc", scale = TRUE),
+  tmx = list(nc = "CRU_TS4.09_tmx_1961_2024.nc", scale = TRUE),
+  dtr = list(nc = "CRU_TS4.09_dtr_1961_2024.nc", scale = TRUE),
+  wet = list(nc = "CRU_TS4.09_wet_1961_2024.nc", scale = FALSE),
+  frs = list(nc = "CRU_TS4.09_frs_1961_2024.nc", scale = FALSE),
+  cld = list(nc = "CRU_TS4.09_cld_1961_2024.nc", scale = FALSE),
+  vap = list(nc = "CRU_TS4.09_vap_1961_2024.nc", scale = TRUE),  # kept as general control only
+  pet = list(nc = "CRU_TS4.09_pet_1961_2024.nc", scale = FALSE)  # used for Aridity Index in Step 6
+)
+
+# Build year x month skeleton: 1961-2024 x 12 months = 768 rows
+years_seq  <- 1961:2024
+year_month_df <- expand.grid(Ay = 1:12, Yil = years_seq)
+year_month_df <- year_month_df[order(year_month_df$Yil, year_month_df$Ay), ]
+rownames(year_month_df) <- NULL
+
+# Scale check: if abs(mean) > 100 the INT16 x 0.1 factor was not applied
+check_scale <- function(v, var_name) {
+  if (abs(mean(v, na.rm = TRUE)) > 100) {
+    cat("  [SCALE]", var_name, "0.1 applied\n")
+    return(v * 0.1)
+  }
+  return(v)
+}
+
+# CRU's pet variable is a DAILY-RATE potential evapotranspiration (mm/day)
+# for each month, NOT a monthly total -- unlike pre, which is already a
+# monthly total. Summing 12 monthly pet values directly (as if they were
+# already monthly totals) undercounts true annual PET by a factor of
+# roughly 30 (the average number of days per month). This helper returns
+# the correct day count for a given year/month (leap-year aware), used to
+# convert pet (mm/day) into a monthly total (mm/month) before summing to
+# get PET_ann (mm/year).
+days_in_month_of <- function(yil, ay) {
+  d1 <- as.Date(sprintf("%04d-%02d-01", yil, ay))
+  d2 <- as.Date(ifelse(ay == 12,
+                       sprintf("%04d-01-01", yil + 1),
+                       sprintf("%04d-%02d-01", yil, ay + 1)))
+  as.integer(d2 - d1)
+}
+
+
+# ==============================================================================
+# 3. LOAD FAO DATA + DERIVE COUNTRY LIST
+#
+# The country list is NOT read from any previously self-generated file.
+# It is derived directly from raw FAOSTAT records: a country enters the
+# panel only if FAOSTAT reports Production or Yield for at least one of
+# the eight target crops, 1961-2024, excluding regional aggregates.
+#
+# iso_to_fao is a name-translation table (ISO 3166 code -> FAOSTAT country
+# name), not a data source -- it plays the same role as a unit-conversion
+# table and carries no analytical content of its own.
+#
+# fao_wide produced here is reused later in Step 2 (per-crop join) and in
+# Step 3 (extra-country patch), so it is only loaded once.
+# ==============================================================================
+
+library(data.table)
+
+# -- ISO -> FAO country name mapping (translation table, not a data source) ---
+iso_to_fao <- list(
+  AFG="Afghanistan",    ALB="Albania",        DZA="Algeria",
+  AGO="Angola",         ARG="Argentina",      ARM="Armenia",
+  AUS="Australia",      AUT="Austria",        AZE="Azerbaijan",
+  BHS="Bahamas",        BHR="Bahrain",        BGD="Bangladesh",
+  BLR="Belarus",        BEL="Belgium",        BLZ="Belize",
+  BEN="Benin",          BOL="Bolivia (Plurinational State of)",
+  BIH="Bosnia and Herzegovina",               BWA="Botswana",
+  BRA="Brazil",         BRN="Brunei Darussalam",
+  BGR="Bulgaria",       BFA="Burkina Faso",   BDI="Burundi",
+  KHM="Cambodia",       CMR="Cameroon",       CAN="Canada",
+  TCD="Chad",           CHL="Chile",
+  CHN="China, mainland",
+  COL="Colombia",       COG="Congo",
+  CRI="Costa Rica",
+  CIV="CIV_PLACEHOLDER",
+  HRV="Croatia",        CUB="Cuba",           CYP="Cyprus",
+  CZE="Czechia",        COD="Democratic Republic of the Congo",
+  PRK="Democratic People's Republic of Korea",
+  DNK="Denmark",        DOM="Dominican Republic",
+  ECU="Ecuador",        EGY="Egypt",          SLV="El Salvador",
+  GNQ="Equatorial Guinea",                    ERI="Eritrea",
+  EST="Estonia",        ETH="Ethiopia",
+  FIN="Finland",        FRA="France",
+  GAB="Gabon",          GMB="Gambia",         GEO="Georgia",
+  DEU="Germany",        GHA="Ghana",          GRC="Greece",
+  GTM="Guatemala",      GIN="Guinea",         GNB="Guinea-Bissau",
+  GUY="Guyana",         HTI="Haiti",          HND="Honduras",
+  HUN="Hungary",        ISL="Iceland",        IND="India",
+  IDN="Indonesia",
+  IRN="Iran (Islamic Republic of)",
+  IRQ="Iraq",           IRL="Ireland",        ISR="Israel",
+  ITA="Italy",          JAM="Jamaica",        JPN="Japan",
+  JOR="Jordan",         KAZ="Kazakhstan",     KEN="Kenya",
+  KWT="Kuwait",         KGZ="Kyrgyzstan",
+  LAO="Lao People's Democratic Republic",
+  LVA="Latvia",         LBN="Lebanon",        LSO="Lesotho",
+  LBR="Liberia",        LBY="Libya",          LTU="Lithuania",
+  MDG="Madagascar",     MWI="Malawi",         MYS="Malaysia",
+  MLI="Mali",           MLT="Malta",          MRT="Mauritania",
+  MUS="Mauritius",      MEX="Mexico",         MDA="Republic of Moldova",
+  MNG="Mongolia",       MNE="Montenegro",     MAR="Morocco",
+  MOZ="Mozambique",     MMR="Myanmar",        NAM="Namibia",
+  NPL="Nepal",
+  NLD="Netherlands (Kingdom of the)",
+  NZL="New Zealand",    NIC="Nicaragua",      NER="Niger",
+  NGA="Nigeria",        MKD="North Macedonia",
+  NOR="Norway",         OMN="Oman",           PAK="Pakistan",
+  PAN="Panama",         PNG="Papua New Guinea",
+  PRY="Paraguay",       PER="Peru",           PHL="Philippines",
+  POL="Poland",         PRT="Portugal",       QAT="Qatar",
+  KOR="Republic of Korea",
+  ROU="Romania",        RUS="Russian Federation",
+  RWA="Rwanda",         SAU="Saudi Arabia",   SEN="Senegal",
+  SRB="Serbia",         SLE="Sierra Leone",   SGP="Singapore",
+  SVK="Slovakia",       SVN="Slovenia",       SOM="Somalia",
+  ZAF="South Africa",   SSD="South Sudan",    ESP="Spain",
+  LKA="Sri Lanka",      SDN="Sudan",          SWE="Sweden",
+  CHE="Switzerland",    SYR="Syrian Arab Republic",
+  TJK="Tajikistan",     THA="Thailand",       TGO="Togo",
+  TTO="Trinidad and Tobago",
+  TUN="Tunisia",
+  TUR="TUR_PLACEHOLDER",
+  TKM="Turkmenistan",   UGA="Uganda",         UKR="Ukraine",
+  ARE="United Arab Emirates",
+  GBR="United Kingdom of Great Britain and Northern Ireland",
+  TZA="United Republic of Tanzania",
+  USA="United States of America",
+  URY="Uruguay",        UZB="Uzbekistan",
+  VEN="Venezuela (Bolivarian Republic of)",
+  VNM="Viet Nam",       YEM="Yemen",
+  ZMB="Zambia",         ZWE="Zimbabwe"
+)
+
+iso_map <- do.call(rbind, lapply(names(iso_to_fao), function(i)
+  data.frame(Country_ISO = i, fao_area = iso_to_fao[[i]],
+             stringsAsFactors = FALSE)))
+
+dup_iso <- iso_map$Country_ISO[duplicated(iso_map$Country_ISO)]
+if (length(dup_iso) > 0) {
+  cat("[WARNING] Duplicate ISO codes:\n"); print(dup_iso)
+} else cat("[OK] iso_map:", nrow(iso_map), "countries\n")
+
+# -- Load raw FAOSTAT production data ------------------------------------------
+
+cat("\n[*] Loading FAO data...\n")
+
+fao_raw <- as.data.frame(data.table::fread(
+  fao_csv, encoding = "UTF-8",
+  select = c("Area", "Item", "Element", "Year", "Value"),
+  showProgress = FALSE))
+cat("[OK]", format(nrow(fao_raw), big.mark = ","), "rows read\n")
+
+fao_raw$Year  <- as.integer(gsub("'", "", as.character(fao_raw$Year)))
+fao_raw$Value <- as.numeric(as.character(fao_raw$Value))
+
+# Fix Turkey and Cote d'Ivoire country names (encoding differences)
+tur_actual <- unique(fao_raw$Area[
+  grepl("rkiye|Turkey|TURKEY", fao_raw$Area)])
+cat("[TUR] actual name:", paste(tur_actual, collapse = " | "), "\n")
+if (length(tur_actual) >= 1)
+  iso_map$fao_area[iso_map$Country_ISO == "TUR"] <- tur_actual[1]
+
+civ_actual <- unique(fao_raw$Area[
+  grepl("voire|Ivory", fao_raw$Area, ignore.case = TRUE)])
+cat("[CIV] actual name:", paste(civ_actual, collapse = " | "), "\n")
+if (length(civ_actual) >= 1)
+  iso_map$fao_area[iso_map$Country_ISO == "CIV"] <- civ_actual[1]
+
+# Remove regional aggregates -- these are not countries and must not enter
+# the country list or the panel
+regional_aggregates <- c(
+  "World","Africa","Eastern Africa","Middle Africa","Northern Africa",
+  "Southern Africa","Western Africa","Americas","Northern America",
+  "Central America","Caribbean","South America","Asia","Central Asia",
+  "Eastern Asia","Southern Asia","South-eastern Asia","Western Asia",
+  "Europe","Eastern Europe","Northern Europe","Southern Europe",
+  "Western Europe","Oceania","Australia and New Zealand","Melanesia",
+  "Micronesia","Polynesia","European Union (27)",
+  "Least Developed Countries (LDCs)","Land Locked Developing Countries (LLDCs)",
+  "Small Island Developing States (SIDS)","Low Income Food Deficit Countries (LIFDCs)",
+  "Net Food Importing Developing Countries (NFIDCs)",
+  "USSR","Yugoslav SFR","Czechoslovakia","Ethiopia PDR","Sudan (former)",
+  "Serbia and Montenegro","Belgium-Luxembourg","China","China, Hong Kong SAR",
+  "China, Macao SAR","China, Taiwan Province of","Palestine"
+)
+
+# Target FAO item names, derived from crop_config (Section 1)
+all_fao_items <- unique(unlist(lapply(crop_config, `[[`, "fao")))
+
+# Filter to target crops, Production/Yield/Area harvested, valid year range,
+# and drop regional aggregates
+fao_filtered <- fao_raw[
+  fao_raw$Item    %in% all_fao_items &
+    fao_raw$Element %in% c("Area harvested", "Production", "Yield") &
+    fao_raw$Year    >= 1961 & fao_raw$Year <= 2024 &
+    !fao_raw$Area   %in% regional_aggregates, ]
+
+cat("[OK] Filtered FAO:", format(nrow(fao_filtered), big.mark = ","), "rows\n")
+
+# Pivot to wide format (one row per country x year x item)
+fao_wide <- fao_filtered %>%
+  dplyr::group_by(Area, Year, Item, Element) %>%
+  dplyr::summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Element, values_from = Value) %>%
+  as.data.frame()
+
+names(fao_wide)[names(fao_wide) == "Area harvested"] <- "area_harvested_ha"
+names(fao_wide)[names(fao_wide) == "Production"]     <- "production_tonnes"
+names(fao_wide)[names(fao_wide) == "Yield"]          <- "yield_hg_per_ha"
+names(fao_wide)[names(fao_wide) == "Area"]           <- "fao_area"
+
+fao_wide <- merge(fao_wide, iso_map, by = "fao_area", all.x = TRUE)
+
+# Report FAO area names that could not be matched to an ISO code (visibility
+# check -- these rows are dropped, they are not silently lost)
+unmatched_areas <- sort(unique(fao_wide$fao_area[is.na(fao_wide$Country_ISO)]))
+if (length(unmatched_areas) > 0) {
+  cat("[WARNING] FAO area names with no ISO match (dropped):\n")
+  cat(" ", paste(unmatched_areas, collapse = ", "), "\n")
+}
+
+fao_wide <- fao_wide[!is.na(fao_wide$Country_ISO), ]
+cat("[OK] fao_wide:", nrow(fao_wide), "rows |",
+    length(unique(fao_wide$Country_ISO)), "countries\n")
+
+# -- Derive the country list directly from FAOSTAT (Production or Yield) ------
+# Any country with at least one Production or Yield observation for any of
+# the eight target crops, in the valid year range, enters the panel.
+country_list <- sort(unique(
+  fao_wide$Country_ISO[!is.na(fao_wide$production_tonnes) |
+                         !is.na(fao_wide$yield_hg_per_ha)]))
+
+cat("[OK]", length(country_list),
+    "countries derived from FAOSTAT (Production or Yield, 1961-2024)\n\n")
+
+
+
+# ==============================================================================
+# STEP 1 -- CRU + CROPGRIDS -> monthly panel (panelv1)
+#
+# Loop order: COUNTRY on the outside, CROP on the inside.
+#
+# Climate data (CRU) does not depend on crop -- a country's temperature and
+# precipitation series is the same regardless of which crop is being
+# weighted. Only the AREA WEIGHT raster (CROPGRIDS) depends on crop. The
+# previous crop-outer loop order re-cropped and re-masked the full 768-layer
+# CRU stack once per crop per country (8x redundant work for the same
+# country). Looping country-outer instead means each country's CRU stack is
+# cropped and masked ONCE, then reused for all 8 crops -- only the cheap
+# CROPGRIDS resample step is repeated per crop.
+#
+# For each country:
+#   1. Clip to GADM boundary, crop+mask the CRU stack ONCE
+#   2. For each crop: resample that crop's CROPGRIDS weight raster,
+#      compute the weighted mean of each CRU variable across the country
+#   3. Append the resulting row to that crop's panel
+# After all countries: write each crop's panel to panelv1_<crop>.xlsx
+# ==============================================================================
+
+# -- CROPGRIDS file/variable helpers --------------------------------------------
+# VERIFY the file naming pattern and the harvested-area variable name against
+# the actual downloaded CROPGRIDS files -- adjust cropgrids_file() and the
+# candidate variable names in load_cropgrids_harvarea() if they don't match.
+
+cropgrids_file <- function(cropgrids_key) {
+  # Official naming for the downloaded version: CROPGRIDSv1.08_[CROP].nc
+  primary <- file.path(cropgrids_dir, paste0("CROPGRIDSv1.08_", cropgrids_key, ".nc"))
+  if (file.exists(primary)) return(primary)
+  
+  # Fallback: scan the directory for any CROPGRIDS file matching this crop
+  # name, in case a different dataset version (e.g. v1.08) was downloaded
+  candidates <- list.files(
+    cropgrids_dir,
+    pattern = paste0("^CROPGRIDSv.*_", cropgrids_key, "\\.nc$"),
+    full.names = TRUE, ignore.case = TRUE)
+  if (length(candidates) >= 1) return(candidates[1])
+  
+  primary   # return the expected path anyway so the [!] message is informative
+}
+
+# Loads the harvested-area layer from a CROPGRIDS NetCDF file. CROPGRIDS
+# NetCDFs typically contain multiple variables (e.g. harvested area,
+# irrigated/rainfed splits); this picks the harvested-area one by name
+# matching, and reports the variables actually found if none match so the
+# candidate list can be corrected.
+#
+# CRITICAL: CROPGRIDS encodes non-harvested-area pixels with NEGATIVE
+# sentinel codes -- -1 = "not assessed", -2 = "ocean/water" -- rather than
+# NA. Left as literal negative numbers, these act as negative weights in
+# every downstream weighted-average calculation, which can silently flip
+# the sign or blow up the scale of TMX_ann/PRE_ann for any country whose
+# boundary includes such pixels (coastal countries especially). They are
+# converted to NA here, once, so nothing downstream ever sees them.
+load_cropgrids_harvarea <- function(nc_path) {
+  candidates <- c("harvarea", "harvested_area", "harv_area", "area",
+                  "cropland_area", "hectares")
+  sds <- tryCatch(terra::sds(nc_path), error = function(e) NULL)
+  r <- if (is.null(sds)) {
+    tryCatch(terra::rast(nc_path), error = function(e) NULL)
+  } else {
+    var_names <- names(sds)
+    match_idx  <- which(tolower(var_names) %in% candidates)
+    if (length(match_idx) == 0) {
+      cat("  [WARNING] No harvested-area variable match in", basename(nc_path),
+          "-- available variables:", paste(var_names, collapse = ", "), "\n")
+      match_idx <- 1   # fallback: first variable, flagged above for manual check
+    }
+    sds[[match_idx[1]]]
+  }
+  if (!is.null(r)) r[r < 0] <- NA   # strip -1 "not assessed" / -2 "ocean" flags
+  r
+}
+
+# -- Load CRU files once (shared across all countries and all crops) -----------
+cat("[*] Loading CRU files (shared across all crops)...\n")
+cru_list <- list()
+for (v in names(cru_var_info)) {
+  nc_path <- file.path(climate_dir, cru_var_info[[v]]$nc)
+  if (!file.exists(nc_path)) { cat("  [!] Missing:", nc_path, "\n"); next }
+  cru_list[[v]] <- terra::rast(nc_path)
+  cat("  [OK]", v, "-", terra::nlyr(cru_list[[v]]), "layers\n")
+}
+
+# -- Load each crop's CROPGRIDS harvested-area raster once (shared across all countries) --
+cat("\n[*] Loading CROPGRIDS harvested-area rasters (one per crop)...\n")
+cropgrids_rast <- list()
+for (crop_name in names(crop_config)) {
+  cg_file <- cropgrids_file(crop_config[[crop_name]]$cropgrids)
+  if (!file.exists(cg_file)) {
+    cat("  [!] Missing CROPGRIDS file for", crop_name, ":", cg_file, "\n"); next
+  }
+  cropgrids_rast[[crop_name]] <- load_cropgrids_harvarea(cg_file)
+  cat("  [OK]", crop_name, "-", basename(cg_file), "\n")
+}
+
+missing_cg <- setdiff(names(crop_config), names(cropgrids_rast))
+if (length(missing_cg) > 0)
+  stop("CROPGRIDS files missing for: ", paste(missing_cg, collapse = ", "),
+       " -- check cropgrids_dir and file naming before continuing")
+
+# -- Main country-outer loop -----------------------------------------------------
+cat("\n", strrep("#", 60), "\nSTEP 1: PROCESSING", length(country_list),
+    "COUNTRIES x 8 CROPS\n", strrep("#", 60), "\n\n")
+
+panel_list <- setNames(vector("list", length(crop_config)), names(crop_config))
+for (crop_name in names(crop_config)) panel_list[[crop_name]] <- list()
+
+for (iso in country_list) {
+  cat("\n>>", iso)
+  t0 <- Sys.time()
+  
+  # Load GADM country boundary (use cached .rds if available)
+  gadm_cache <- file.path(base_dir, "gadm",
+                          paste0("gadm_41_", iso, "_0_pk.rds"))
+  if (file.exists(gadm_cache)) {
+    boundary <- readRDS(gadm_cache)
+    cat(" [cache]")
+  } else {
+    boundary <- tryCatch(
+      geodata::gadm(country = iso, level = 0, path = base_dir),
+      error = function(e) { cat(" [GADM error]"); NULL })
+  }
+  if (is.null(boundary)) next
+  
+  # Crop + mask the full CRU stack ONCE for this country -- reused by all 8 crops
+  cru_country <- list()
+  for (v in names(cru_list)) {
+    cru_country[[v]] <- terra::mask(
+      terra::crop(cru_list[[v]], terra::ext(boundary)), boundary)
+  }
+  
+  # For each crop: resample that crop's CROPGRIDS weight and compute the
+  # weighted mean of each CRU variable using the already-cropped CRU stack
+  for (crop_name in names(crop_config)) {
+    cg_global <- cropgrids_rast[[crop_name]]
+    cg_crop   <- terra::crop(cg_global, terra::ext(boundary))
+    
+    country_tbl <- data.frame(Country_ISO = iso,
+                              Yil = year_month_df$Yil, Ay = year_month_df$Ay)
+    
+    ref_r    <- cru_country[[1]][[1]]
+    cg_res   <- terra::resample(cg_crop, ref_r, method = "sum")
+    cg_m     <- terra::mask(cg_res, boundary)
+    w_base   <- as.vector(terra::values(cg_m))
+    has_area <- !is.na(sum(w_base, na.rm = TRUE)) &&
+      sum(w_base, na.rm = TRUE) > 0
+    
+    for (v in names(cru_country)) {
+      v_mat <- terra::values(cru_country[[v]])   # matrix: pixels x 768 months
+      
+      if (has_area) {
+        # Re-resample CROPGRIDS weight to this variable's resolution
+        cg_res2 <- terra::resample(cg_crop, cru_country[[v]][[1]], method = "sum")
+        w  <- as.vector(terra::values(terra::mask(cg_res2, boundary)))
+        ws <- sum(w, na.rm = TRUE)
+        monthly <- if (!is.na(ws) && ws > 0)
+          colSums(v_mat * w, na.rm = TRUE) / ws   # weighted mean
+        else
+          colMeans(v_mat, na.rm = TRUE)            # fallback: simple mean
+      } else {
+        monthly <- colMeans(v_mat, na.rm = TRUE)
+      }
+      
+      if (cru_var_info[[v]]$scale) monthly <- check_scale(monthly, v)
+      country_tbl[[toupper(v)]] <- monthly
+    }
+    
+    panel_list[[crop_name]][[iso]] <- country_tbl
+  }
+  
+  cat("  [", round(difftime(Sys.time(), t0, units = "secs"), 1), "s]")
+}
+
+# -- Combine and save each crop's panel ------------------------------------------
+for (crop_name in names(crop_config)) {
+  cfg <- crop_config[[crop_name]]
+  panel_final <- do.call(rbind, panel_list[[crop_name]])
+  panel_final <- panel_final[order(panel_final$Country_ISO,
+                                   panel_final$Yil, panel_final$Ay), ]
+  rownames(panel_final) <- NULL
+  
+  cat("\n[OK]", crop_name, "- Rows:", nrow(panel_final),
+      "| Cols:", ncol(panel_final), "\n")
+  
+  output_path <- file.path(base_dir, paste0(cfg$p1, ".xlsx"))
+  writexl::write_xlsx(panel_final, output_path)
+  cat("[SAVED]", output_path, "\n")
+}
+gc()
+
+
+# ==============================================================================
+# STEP 2 -- ANNUAL AGGREGATION + FAO YIELD JOIN -> panelv2
+#
+# For each crop:
+#   1. Aggregate monthly panel to annual (mean for temperature-type variables,
+#      sum for precipitation-type variables)
+#   2. Join FAO yield/production/area, CO2, and fallback GDP
+#   3. Apply yield and minimum-year filters
+# No phenology windows are used anywhere in this step.
+# fao_wide was already built in Section 3 above and is reused here directly --
+# it is not reloaded.
+# ==============================================================================
+
+library(readxl); library(writexl); library(dplyr)
+library(tidyr);  library(zoo);     library(data.table)
+
+# Filter thresholds
+YIELD_THRESHOLD <- 1     # minimum yield (hg/ha) -- drops zero/invalid records only
+MIN_YEARS        <- 10   # minimum years per country -- required for meaningful
+# within-country variation in TWFE models (cf. Burke &
+# Emerick 2016; Dell et al. 2014). A country with only
+# 1-2 years is fully absorbed by its own fixed effect
+# and contributes no identifying information.
+
+# Fixed, non-contemporaneous baseline window -- shared by (a) the fixed
+# aridity classification (Step 6) and (b) the fixed-baseline production/
+# area weights (Step 7). Using the same window for every "fixed country
+# characteristic" in the pipeline is a single, consistent design choice:
+# structural, non-time-varying country attributes are all anchored to
+# 1990-2000, with a documented fallback to a country's own earliest
+# available years when it has no data in that window at all.
+BASELINE_START <- 1990
+BASELINE_END   <- 2000
+BASELINE_LEN   <- BASELINE_END - BASELINE_START + 1   # 11
+
+# -- Load CO2 -------------------------------------------------------------------
+cat("[*] CO2...\n")
+co2_df <- read.csv(co2_csv, stringsAsFactors = FALSE)
+names(co2_df) <- trimws(names(co2_df))
+co2_df <- data.frame(
+  Yil     = as.integer(co2_df[[grep("^[Yy]ear$",   names(co2_df), value=TRUE)[1]]]),
+  CO2_ppm = as.numeric(co2_df[[grep("CO2|co2|ppm", names(co2_df), value=TRUE)[1]]]))
+co2_df <- co2_df[!is.na(co2_df$Yil), ]
+cat("[OK] CO2:", min(co2_df$Yil), "-", max(co2_df$Yil), "\n")
+
+
+# -- Load GDP (fallback CSV -- replaced by WDI in Step 7) ----------------------
+cat("[*] GDP (fallback)...\n")
+gdp_fallback <- read.csv(gdp_csv, stringsAsFactors = FALSE)
+names(gdp_fallback) <- trimws(names(gdp_fallback))
+gdp_fallback <- data.frame(
+  Country_ISO    = gdp_fallback[[grep("ISO|country_iso",
+                                      names(gdp_fallback), ignore.case=TRUE, value=TRUE)[1]]],
+  Yil            = as.integer(gdp_fallback[[grep("^[Yy]ear$",
+                                                 names(gdp_fallback), value=TRUE)[1]]]),
+  GDP_per_Capita = as.numeric(gdp_fallback[[grep("GDP|Capita",
+                                                 names(gdp_fallback), value=TRUE)[1]]]))
+gdp_fallback <- gdp_fallback[!is.na(gdp_fallback$Yil), ]
+cat("[OK] GDP:", length(unique(gdp_fallback$Country_ISO)), "countries\n")
+
+
+# ==============================================================================
+# STEP 2 -- FUNCTION: annual aggregation (monthly -> annual + FAO join)
+#
+# All climate variables are annual means (temperature-type) or annual sums
+# (precipitation-type). No phenology windows, no flowering/grain-fill flags.
+# ==============================================================================
+
+annual_aggregate <- function(crop_name, monthly_df, fao_crop_df) {
+  
+  annual_df <- monthly_df %>%
+    dplyr::arrange(Country_ISO, Yil, Ay) %>%
+    dplyr::group_by(Country_ISO, Yil) %>%
+    dplyr::summarise(
+      TMP_ann = mean(TMP, na.rm = TRUE), TMX_ann = mean(TMX, na.rm = TRUE),
+      TMN_ann = mean(TMN, na.rm = TRUE), DTR_ann = mean(DTR, na.rm = TRUE),
+      CLD_ann = mean(CLD, na.rm = TRUE), VAP_ann = mean(VAP, na.rm = TRUE),
+      PRE_ann = sum(PRE,  na.rm = TRUE), PET_ann = sum(PET * days_in_month_of(Yil, Ay), na.rm = TRUE),
+      WET_ann = sum(WET,  na.rm = TRUE), FRS_ann = sum(FRS, na.rm = TRUE),
+      TempVariance = var(TMP, na.rm = TRUE),
+      .groups = "drop") %>%
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                ~ifelse(is.nan(.), NA_real_, .)))
+  
+  # Join FAO yield, CO2, fallback GDP
+  annual_df <- annual_df %>%
+    dplyr::left_join(
+      fao_crop_df[, c("Country_ISO","Year","area_harvested_ha",
+                      "production_tonnes","yield_hg_per_ha")],
+      by = c("Country_ISO", "Yil" = "Year")) %>%
+    dplyr::left_join(co2_df, by = "Yil") %>%
+    dplyr::left_join(gdp_fallback, by = c("Country_ISO","Yil"))
+  
+  # Reorder columns: key identifiers first
+  first_cols <- c("Country_ISO","Yil","production_tonnes","area_harvested_ha",
+                  "yield_hg_per_ha","CO2_ppm","GDP_per_Capita",
+                  "TMP_ann","TMX_ann","TMN_ann","DTR_ann","CLD_ann","VAP_ann",
+                  "PRE_ann","PET_ann","WET_ann","FRS_ann","TempVariance")
+  present_cols <- first_cols[first_cols %in% names(annual_df)]
+  annual_df[, c(present_cols, setdiff(names(annual_df), present_cols))]
+}
+
+
+# -- Run Step 2: panelv1 -> panelv2 --------------------------------------------
+
+cat(strrep("=", 60), "\nSTEP 2: panelv1_* -> panelv2_*\n",
+    strrep("=", 60), "\n\n")
+
+panelv1_countries <- list()
+
+for (crop_name in names(crop_config)) {
+  cfg <- crop_config[[crop_name]]
+  input_path  <- file.path(base_dir, paste0(cfg$p1, ".xlsx"))
+  output_path <- file.path(base_dir, paste0("panelv2_", crop_name, ".xlsx"))
+  cat("\n---", toupper(crop_name), "---\n")
+  if (!file.exists(input_path)) { cat("[ERROR] panelv1 missing\n"); next }
+  
+  monthly_df <- as.data.frame(readxl::read_excel(input_path))
+  panelv1_countries[[crop_name]] <- sort(unique(monthly_df$Country_ISO))
+  cat("[OK]", nrow(monthly_df), "rows |",
+      length(unique(monthly_df$Country_ISO)), "countries\n")
+  
+  fao_crop_sub <- fao_wide[fao_wide$Item %in% cfg$fao, ]
+  annual_df <- tryCatch(
+    annual_aggregate(crop_name, monthly_df, fao_crop_sub),
+    error = function(e) { cat("[ERROR]", conditionMessage(e), "\n"); NULL })
+  if (is.null(annual_df)) next
+  
+  # Apply yield/year filters
+  n0 <- nrow(annual_df)
+  annual_df <- annual_df[!is.na(annual_df$production_tonnes), ]
+  n1 <- nrow(annual_df)
+  cat("  Remove FAO NA:", n0 - n1, "| remaining:", n1, "\n")
+  
+  annual_df <- annual_df[!is.na(annual_df$yield_hg_per_ha) &
+                           annual_df$yield_hg_per_ha >= YIELD_THRESHOLD, ]
+  n2 <- nrow(annual_df)
+  cat("  Remove yield <", YIELD_THRESHOLD, ":", n1 - n2, "| remaining:", n2, "\n")
+  
+  year_counts <- annual_df %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop")
+  annual_df <- annual_df[annual_df$Country_ISO %in%
+                           year_counts$Country_ISO[year_counts$n >= MIN_YEARS], ]
+  n3 <- nrow(annual_df)
+  cat("  Remove <", MIN_YEARS, "years:", n2 - n3,
+      "| remaining:", n3, "rows |", length(unique(annual_df$Country_ISO)), "countries\n")
+  
+  writexl::write_xlsx(annual_df, output_path)
+  cat("  [SAVED]", basename(output_path), "\n")
+  rm(monthly_df, annual_df, fao_crop_sub); gc()
+}
+
+
+# ==============================================================================
+# STEP 3 -- EXTRA COUNTRIES (IRN, EGY, NGA, SDN) -> panelv3
+#
+# These countries were missing from panelv2 due to GADM boundary issues.
+# Fix: extract climate using GADM cache (or rnaturalearth for Egypt),
+# join FAO data from extra_countries_xls. Result appended to panelv2 -> panelv3.
+# ==============================================================================
+
+library(terra); library(geodata)
+library(dplyr); library(readxl); library(writexl)
+library(data.table); library(tidyr); library(zoo)
+
+EXTRA_COUNTRIES <- c("IRN", "EGY", "NGA", "SDN")
+
+cat("\n", strrep("=", 60), "\n")
+cat("STEP 3: Climate extraction for extra countries\n")
+cat(strrep("=", 60), "\n\n")
+
+cat("[*] Loading CRU files...\n")
+cru_list <- list()
+for (v in names(cru_var_info)) {
+  nc_path <- file.path(climate_dir, cru_var_info[[v]]$nc)
+  if (!file.exists(nc_path)) { cat("  [!] Missing:", v, "\n"); next }
+  cru_list[[v]] <- terra::rast(nc_path)
+  cat("  [OK]", v, "\n")
+}
+
+# CROPGRIDS rasters already loaded once in Step 1 (cropgrids_rast) -- reused
+# here rather than reloaded, same country-outer logic as Step 1: CRU is
+# cropped/masked once per country, then each crop's CROPGRIDS weight is
+# resampled against that shared CRU stack.
+extra_climate_by_crop <- setNames(vector("list", length(crop_config)), names(crop_config))
+for (crop_name in names(crop_config)) extra_climate_by_crop[[crop_name]] <- list()
+
+for (iso in EXTRA_COUNTRIES) {
+  cat("\n>>", iso)
+  t0 <- Sys.time()
+  
+  gadm_cache <- file.path(base_dir, "gadm",
+                          paste0("gadm_41_", iso, "_0_pk.rds"))
+  if (file.exists(gadm_cache)) {
+    boundary <- readRDS(gadm_cache); cat(" [cache]")
+  } else {
+    boundary <- tryCatch(
+      geodata::gadm(country = iso, level = 0, path = base_dir),
+      error = function(e) { cat(" [GADM error]"); NULL })
+  }
+  if (is.null(boundary)) next
+  
+  # Crop + mask CRU ONCE for this country, reused across all 8 crops
+  cru_country <- list()
+  for (v in names(cru_list)) {
+    cru_country[[v]] <- terra::mask(
+      terra::crop(cru_list[[v]], terra::ext(boundary)), boundary)
+  }
+  
+  for (crop_name in names(crop_config)) {
+    cg_global <- cropgrids_rast[[crop_name]]
+    cg_crop   <- terra::crop(cg_global, terra::ext(boundary))
+    
+    country_tbl <- data.frame(Country_ISO = iso,
+                              Yil = year_month_df$Yil, Ay = year_month_df$Ay)
+    
+    ref_r    <- cru_country[[1]][[1]]
+    cg_res   <- terra::resample(cg_crop, ref_r, method = "sum")
+    cg_m     <- terra::mask(cg_res, boundary)
+    w_base   <- as.vector(terra::values(cg_m))
+    has_area <- !is.na(sum(w_base, na.rm = TRUE)) &&
+      sum(w_base, na.rm = TRUE) > 0
+    
+    for (v in names(cru_country)) {
+      v_mat <- terra::values(cru_country[[v]])
+      
+      if (has_area) {
+        cg_res2 <- terra::resample(cg_crop, cru_country[[v]][[1]], method = "sum")
+        w  <- as.vector(terra::values(terra::mask(cg_res2, boundary)))
+        ws <- sum(w, na.rm = TRUE)
+        monthly <- if (!is.na(ws) && ws > 0)
+          colSums(v_mat * w, na.rm = TRUE) / ws
+        else
+          colMeans(v_mat, na.rm = TRUE)
+      } else {
+        monthly <- colMeans(v_mat, na.rm = TRUE)
+      }
+      
+      if (cru_var_info[[v]]$scale) monthly <- check_scale(monthly, v)
+      country_tbl[[toupper(v)]] <- monthly
+    }
+    
+    extra_climate_by_crop[[crop_name]][[iso]] <- country_tbl
+  }
+  cat("  [", round(difftime(Sys.time(), t0, units = "secs"), 1), "s]")
+}
+
+cat("\n\n[OK] Step 3 climate extraction complete.\n")
+
+
+# -- Load FAO data for extra countries -----------------------------------------
+
+cat("\n[*] Reading extra_countries_xls...\n")
+extra_raw        <- as.data.frame(readxl::read_xls(extra_countries_xls))
+names(extra_raw) <- trimws(names(extra_raw))
+extra_raw$Value  <- as.numeric(gsub(",", ".", as.character(extra_raw$Value)))
+extra_raw$Year   <- as.integer(gsub("'", "", as.character(extra_raw$Year)))
+
+iso_extra <- c(
+  "Iran (Islamic Republic of)" = "IRN",
+  "Egypt"                       = "EGY",
+  "Nigeria"                     = "NGA",
+  "Sudan"                       = "SDN")
+extra_raw$Country_ISO <- iso_extra[extra_raw$Area]
+
+extra_filtered <- extra_raw[
+  !is.na(extra_raw$Country_ISO) &
+    extra_raw$Item    %in% all_fao_items &
+    extra_raw$Element %in% c("Area harvested","Production","Yield") &
+    extra_raw$Year    >= 1961 & extra_raw$Year <= 2024, ]
+
+extra_fao_wide <- extra_filtered %>%
+  dplyr::group_by(Country_ISO, Year, Item, Element) %>%
+  dplyr::summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Element, values_from = Value) %>%
+  as.data.frame()
+
+names(extra_fao_wide)[names(extra_fao_wide) == "Area harvested"] <- "area_harvested_ha"
+names(extra_fao_wide)[names(extra_fao_wide) == "Production"]     <- "production_tonnes"
+names(extra_fao_wide)[names(extra_fao_wide) == "Yield"]          <- "yield_hg_per_ha"
+cat("[OK] extra_fao_wide:", nrow(extra_fao_wide), "rows\n")
+
+
+# -- Append extra countries to panelv2 -> panelv3 -------------------------------
+
+cat("\n", strrep("=", 60), "\nSTEP 3: Append extra countries -> panelv3_*\n",
+    strrep("=", 60), "\n\n")
+
+for (crop_name in names(crop_config)) {
+  cfg <- crop_config[[crop_name]]
+  input_path  <- file.path(base_dir, paste0("panelv2_", crop_name, ".xlsx"))
+  output_path <- file.path(base_dir, paste0("panelv3_", crop_name, ".xlsx"))
+  cat("\n---", toupper(crop_name), "---\n")
+  if (!file.exists(input_path)) { cat("[ERROR] panelv2 missing\n"); next }
+  
+  panelv2 <- as.data.frame(readxl::read_excel(input_path))
+  fao_sub <- extra_fao_wide[extra_fao_wide$Item %in% cfg$fao, ]
+  
+  if (nrow(fao_sub) == 0) {
+    cat("  [SKIP] No FAO data in extra file for this crop\n")
+    writexl::write_xlsx(panelv2, output_path); next
+  }
+  
+  extra_rows <- list()
+  
+  for (iso in EXTRA_COUNTRIES) {
+    if (!iso %in% unique(fao_sub$Country_ISO)) next
+    if (is.null(extra_climate_by_crop[[crop_name]][[iso]])) next
+    
+    country_monthly <- extra_climate_by_crop[[crop_name]][[iso]]
+    
+    # Annual aggregation for this extra country -- same logic as Step 2
+    annual_extra <- country_monthly %>%
+      dplyr::arrange(Yil, Ay) %>%
+      dplyr::group_by(Country_ISO, Yil) %>%
+      dplyr::summarise(
+        TMP_ann = mean(TMP, na.rm = TRUE), TMX_ann = mean(TMX, na.rm = TRUE),
+        TMN_ann = mean(TMN, na.rm = TRUE), DTR_ann = mean(DTR, na.rm = TRUE),
+        CLD_ann = mean(CLD, na.rm = TRUE), VAP_ann = mean(VAP, na.rm = TRUE),
+        PRE_ann = sum(PRE,  na.rm = TRUE), PET_ann = sum(PET * days_in_month_of(Yil, Ay), na.rm = TRUE),
+        WET_ann = sum(WET,  na.rm = TRUE), FRS_ann = sum(FRS, na.rm = TRUE),
+        TempVariance = var(TMP, na.rm = TRUE),
+        .groups  = "drop") %>%
+      dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                  ~ifelse(is.nan(.), NA_real_, .)))
+    
+    fao_join <- fao_sub[fao_sub$Country_ISO == iso,
+                        c("Country_ISO","Year","area_harvested_ha",
+                          "production_tonnes","yield_hg_per_ha")]
+    annual_extra <- annual_extra %>%
+      dplyr::left_join(fao_join, by = c("Country_ISO","Yil" = "Year")) %>%
+      dplyr::left_join(co2_df,   by = "Yil") %>%
+      dplyr::left_join(gdp_fallback, by = c("Country_ISO","Yil"))
+    
+    extra_rows[[iso]] <- annual_extra
+    cat("  [Annual]", iso, nrow(annual_extra), "rows\n")
+  }
+  
+  if (length(extra_rows) == 0) {
+    writexl::write_xlsx(panelv2, output_path); next
+  }
+  
+  extra_df <- dplyr::bind_rows(extra_rows)
+  # Apply same filters as Step 2
+  extra_df <- extra_df[!is.na(extra_df$production_tonnes), ]
+  extra_df <- extra_df[!is.na(extra_df$yield_hg_per_ha) &
+                         extra_df$yield_hg_per_ha >= YIELD_THRESHOLD, ]
+  year_counts <- extra_df %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop")
+  extra_df <- extra_df[extra_df$Country_ISO %in%
+                         year_counts$Country_ISO[year_counts$n >= MIN_YEARS], ]
+  
+  # Column-align and bind with panelv2
+  for (k in setdiff(names(panelv2), names(extra_df))) extra_df[[k]]  <- NA
+  for (k in setdiff(names(extra_df), names(panelv2))) panelv2[[k]]   <- NA
+  common_cols <- union(names(panelv2), names(extra_df))
+  panelv3 <- rbind(panelv2[, common_cols], extra_df[, common_cols])
+  panelv3 <- panelv3[order(panelv3$Country_ISO, panelv3$Yil), ]
+  rownames(panelv3) <- NULL
+  
+  cat("  [panelv3]", nrow(panelv3), "rows |",
+      length(unique(panelv3$Country_ISO)), "countries\n")
+  writexl::write_xlsx(panelv3, output_path)
+  cat("  [SAVED]", basename(output_path), "\n")
+  rm(panelv2, extra_df, panelv3, extra_rows); gc()
+}
+
+
+# ==============================================================================
+# STEP 3b -- EGYPT PATCH via rnaturalearth
+# GADM failed for EGY for some crops; use rnaturalearth boundary instead.
+# Only applies to crops where EGY count is still 0 after Step 3.
+# ==============================================================================
+
+library(terra); library(sf)
+library(rnaturalearth); library(rnaturalearthdata)
+
+PATCH_ISO   <- "EGY"
+PATCH_CROPS <- c("wheat","barley","oats","rye","sorghum")  # crops still missing EGY
+
+cat("\n", strrep("=", 60), "\n")
+cat("STEP 3b: Egypt patch via rnaturalearth\n")
+cat(strrep("=", 60), "\n\n")
+
+egy_sf      <- rnaturalearth::ne_countries(country = "Egypt", returnclass = "sf")
+egy_boundary <- terra::vect(egy_sf)
+cat("[OK] EGY boundary loaded\n")
+
+egy_climate_by_crop <- list()
+
+# Crop + mask CRU ONCE for Egypt, reused across all PATCH_CROPS
+cru_egy <- list()
+for (v in names(cru_list)) {
+  cru_egy[[v]] <- terra::mask(
+    terra::crop(cru_list[[v]], terra::ext(egy_boundary)), egy_boundary)
+}
+
+for (crop_name in PATCH_CROPS) {
+  cg_global <- cropgrids_rast[[crop_name]]
+  cg_crop   <- terra::crop(cg_global, terra::ext(egy_boundary))
+  
+  country_tbl <- data.frame(Country_ISO = "EGY",
+                            Yil = year_month_df$Yil, Ay = year_month_df$Ay)
+  
+  ref_r    <- cru_egy[[1]][[1]]
+  cg_res   <- terra::resample(cg_crop, ref_r, method = "sum")
+  cg_m     <- terra::mask(cg_res, egy_boundary)
+  w_base   <- as.vector(terra::values(cg_m))
+  has_area <- !is.na(sum(w_base, na.rm = TRUE)) && sum(w_base, na.rm = TRUE) > 0
+  
+  for (v in names(cru_egy)) {
+    v_mat <- terra::values(cru_egy[[v]])
+    if (has_area) {
+      cg_res2 <- terra::resample(cg_crop, cru_egy[[v]][[1]], method = "sum")
+      w  <- as.vector(terra::values(terra::mask(cg_res2, egy_boundary)))
+      ws <- sum(w, na.rm = TRUE)
+      monthly <- if (!is.na(ws) && ws > 0)
+        colSums(v_mat * w, na.rm = TRUE) / ws
+      else colMeans(v_mat, na.rm = TRUE)
+    } else {
+      monthly <- colMeans(v_mat, na.rm = TRUE)
+    }
+    if (cru_var_info[[v]]$scale) monthly <- check_scale(monthly, v)
+    country_tbl[[toupper(v)]] <- monthly
+  }
+  egy_climate_by_crop[[crop_name]] <- country_tbl
+  cat("  [OK] EGY", crop_name, nrow(country_tbl), "rows\n")
+}
+
+# EGY FAO data from extra_countries_xls
+extra_raw2 <- as.data.frame(readxl::read_xls(extra_countries_xls))
+names(extra_raw2) <- trimws(names(extra_raw2))
+extra_raw2$Value  <- as.numeric(gsub(",", ".", as.character(extra_raw2$Value)))
+extra_raw2$Year   <- as.integer(gsub("'", "", as.character(extra_raw2$Year)))
+
+fao_egy <- extra_raw2[
+  extra_raw2$Area == "Egypt" &
+    extra_raw2$Item %in% all_fao_items &
+    extra_raw2$Element %in% c("Area harvested","Production","Yield") &
+    extra_raw2$Year >= 1961 & extra_raw2$Year <= 2024, ]
+fao_egy$Country_ISO <- "EGY"
+
+fao_egy_wide <- fao_egy %>%
+  dplyr::group_by(Country_ISO, Year, Item, Element) %>%
+  dplyr::summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Element, values_from = Value) %>%
+  as.data.frame()
+names(fao_egy_wide)[names(fao_egy_wide) == "Area harvested"] <- "area_harvested_ha"
+names(fao_egy_wide)[names(fao_egy_wide) == "Production"]     <- "production_tonnes"
+names(fao_egy_wide)[names(fao_egy_wide) == "Yield"]          <- "yield_hg_per_ha"
+
+for (crop_name in PATCH_CROPS) {
+  cfg <- crop_config[[crop_name]]
+  panelv3_path <- file.path(base_dir, paste0("panelv3_", crop_name, ".xlsx"))
+  if (!file.exists(panelv3_path)) next
+  panelv3 <- as.data.frame(readxl::read_excel(panelv3_path))
+  if (sum(panelv3$Country_ISO == "EGY") > 0) {
+    cat("  [SKIP]", crop_name, "EGY already in panelv3\n"); next
+  }
+  
+  if (is.null(egy_climate_by_crop[[crop_name]])) next
+  
+  egy_monthly <- egy_climate_by_crop[[crop_name]]
+  fao_sub     <- fao_egy_wide[fao_egy_wide$Item %in% cfg$fao, ]
+  
+  egy_annual <- egy_monthly %>%
+    dplyr::arrange(Yil, Ay) %>%
+    dplyr::group_by(Country_ISO, Yil) %>%
+    dplyr::summarise(
+      TMP_ann = mean(TMP, na.rm = TRUE), TMX_ann = mean(TMX, na.rm = TRUE),
+      TMN_ann = mean(TMN, na.rm = TRUE), DTR_ann = mean(DTR, na.rm = TRUE),
+      CLD_ann = mean(CLD, na.rm = TRUE), VAP_ann = mean(VAP, na.rm = TRUE),
+      PRE_ann = sum(PRE,  na.rm = TRUE), PET_ann = sum(PET * days_in_month_of(Yil, Ay), na.rm = TRUE),
+      WET_ann = sum(WET,  na.rm = TRUE), FRS_ann = sum(FRS, na.rm = TRUE),
+      TempVariance = var(TMP, na.rm = TRUE),
+      .groups = "drop") %>%
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                ~ifelse(is.nan(.), NA_real_, .)))
+  
+  egy_annual <- egy_annual %>%
+    dplyr::left_join(
+      fao_sub[, c("Country_ISO","Year","area_harvested_ha",
+                  "production_tonnes","yield_hg_per_ha")],
+      by = c("Country_ISO","Yil" = "Year")) %>%
+    dplyr::left_join(co2_df, by = "Yil") %>%
+    dplyr::left_join(gdp_fallback, by = c("Country_ISO","Yil"))
+  
+  egy_annual <- egy_annual[!is.na(egy_annual$production_tonnes), ]
+  egy_annual <- egy_annual[!is.na(egy_annual$yield_hg_per_ha) &
+                             egy_annual$yield_hg_per_ha >= YIELD_THRESHOLD, ]
+  
+  for (k in setdiff(names(panelv3),  names(egy_annual))) egy_annual[[k]] <- NA
+  for (k in setdiff(names(egy_annual), names(panelv3)))  panelv3[[k]]    <- NA
+  common_cols <- union(names(panelv3), names(egy_annual))
+  panelv3_new <- rbind(panelv3[, common_cols], egy_annual[, common_cols])
+  panelv3_new <- panelv3_new[order(panelv3_new$Country_ISO, panelv3_new$Yil), ]
+  rownames(panelv3_new) <- NULL
+  
+  writexl::write_xlsx(panelv3_new, panelv3_path)
+  cat("  [SAVED]", crop_name, "EGY added ->", nrow(panelv3_new), "rows\n")
+  rm(panelv3, egy_annual, panelv3_new); gc()
+}
+
+
+# ==============================================================================
+# STEP 4 -- IRRIGATION DATA (FAOSTAT) -> panelv4
+#
+# Adds: land_area_1000ha, equipped_irrig_1000ha, actual_irrig_1000ha,
+#       cropland_irrig_1000ha, irrig_share, cropland_irrig_share,
+#       irrig_intensity
+# ==============================================================================
+
+library(dplyr); library(readxl); library(writexl); library(tidyr)
+
+cat("\n", strrep("=", 60), "\nSTEP 4: Irrigation data -> panelv4_*\n",
+    strrep("=", 60), "\n\n")
+
+irrig_raw        <- as.data.frame(readxl::read_excel(irrigation_xl))
+names(irrig_raw) <- trimws(names(irrig_raw))
+irrig_raw$Value  <- as.numeric(gsub(",", ".", as.character(irrig_raw$Value)))
+irrig_raw$Year   <- as.integer(as.character(irrig_raw$Year))
+
+target_items <- c(
+  "Land area",
+  "Land area equipped for irrigation",
+  "Land area actually irrigated",
+  "Cropland area actually irrigated")
+
+irrig_filtered <- irrig_raw[
+  irrig_raw$Item    %in% target_items &
+    irrig_raw$Element == "Area" &
+    irrig_raw$Year    >= 1961 &
+    irrig_raw$Year    <= 2024, ]
+
+# ISO mapping for irrigation data
+iso_map_irrig <- c(
+  "Afghanistan"="AFG","Albania"="ALB","Algeria"="DZA","Angola"="AGO",
+  "Argentina"="ARG","Armenia"="ARM","Australia"="AUS","Austria"="AUT",
+  "Azerbaijan"="AZE","Bangladesh"="BGD","Belarus"="BLR","Belgium"="BEL",
+  "Benin"="BEN","Bolivia (Plurinational State of)"="BOL",
+  "Bosnia and Herzegovina"="BIH","Botswana"="BWA","Brazil"="BRA",
+  "Bulgaria"="BGR","Burkina Faso"="BFA","Burundi"="BDI",
+  "Cambodia"="KHM","Cameroon"="CMR","Canada"="CAN","Chad"="TCD",
+  "Chile"="CHL","China, mainland"="CHN","Colombia"="COL","Congo"="COG",
+  "Costa Rica"="CRI","Croatia"="HRV","Cuba"="CUB","Cyprus"="CYP",
+  "Czechia"="CZE","Denmark"="DNK","Dominican Republic"="DOM",
+  "Ecuador"="ECU","Egypt"="EGY","El Salvador"="SLV","Eritrea"="ERI",
+  "Estonia"="EST","Ethiopia"="ETH","Finland"="FIN","France"="FRA",
+  "Georgia"="GEO","Germany"="DEU","Ghana"="GHA","Greece"="GRC",
+  "Guatemala"="GTM","Guinea"="GIN","Haiti"="HTI","Honduras"="HND",
+  "Hungary"="HUN","India"="IND","Indonesia"="IDN",
+  "Iran (Islamic Republic of)"="IRN","Iraq"="IRQ","Ireland"="IRL",
+  "Israel"="ISR","Italy"="ITA","Japan"="JPN","Jordan"="JOR",
+  "Kazakhstan"="KAZ","Kenya"="KEN","Republic of Korea"="KOR",
+  "Kuwait"="KWT","Kyrgyzstan"="KGZ","Latvia"="LVA","Lebanon"="LBN",
+  "Libya"="LBY","Lithuania"="LTU","Madagascar"="MDG","Malawi"="MWI",
+  "Malaysia"="MYS","Mali"="MLI","Malta"="MLT","Mexico"="MEX",
+  "Republic of Moldova"="MDA","Mongolia"="MNG","Montenegro"="MNE",
+  "Morocco"="MAR","Mozambique"="MOZ","Myanmar"="MMR","Namibia"="NAM",
+  "Nepal"="NPL","Netherlands (Kingdom of the)"="NLD","New Zealand"="NZL",
+  "Nicaragua"="NIC","Niger"="NER","Nigeria"="NGA",
+  "North Macedonia"="MKD","Norway"="NOR","Pakistan"="PAK",
+  "Panama"="PAN","Paraguay"="PRY","Peru"="PER","Philippines"="PHL",
+  "Poland"="POL","Portugal"="PRT",
+  "Democratic People's Republic of Korea"="PRK",
+  "Romania"="ROU","Russian Federation"="RUS","Rwanda"="RWA",
+  "Saudi Arabia"="SAU","Senegal"="SEN","Serbia"="SRB",
+  "Sierra Leone"="SLE","Slovakia"="SVK","Slovenia"="SVN",
+  "Somalia"="SOM","South Africa"="ZAF","South Sudan"="SSD",
+  "Spain"="ESP","Sri Lanka"="LKA","Sudan"="SDN","Sweden"="SWE",
+  "Switzerland"="CHE","Syrian Arab Republic"="SYR","Tajikistan"="TJK",
+  "United Republic of Tanzania"="TZA","Thailand"="THA","Togo"="TGO",
+  "Tunisia"="TUN","Turkmenistan"="TKM","Uganda"="UGA","Ukraine"="UKR",
+  "United Kingdom of Great Britain and Northern Ireland"="GBR",
+  "United States of America"="USA","Uruguay"="URY","Uzbekistan"="UZB",
+  "Venezuela (Bolivarian Republic of)"="VEN","Viet Nam"="VNM",
+  "Yemen"="YEM","Zambia"="ZMB","Zimbabwe"="ZWE",
+  "Democratic Republic of the Congo"="COD","Cote d'Ivoire"="CIV",
+  "Papua New Guinea"="PNG","Oman"="OMN","Qatar"="QAT",
+  "United Arab Emirates"="ARE","Liberia"="LBR")
+
+irrig_filtered$Country_ISO <- iso_map_irrig[irrig_filtered$Area]
+irrig_filtered$Country_ISO[grepl("rkiye|Turkey", irrig_filtered$Area)] <- "TUR"
+irrig_filtered$Country_ISO[grepl("voire|Ivory",  irrig_filtered$Area)] <- "CIV"
+
+irrig_iso <- irrig_filtered[!is.na(irrig_filtered$Country_ISO), ]
+
+item_to_col <- c(
+  "Land area"                         = "land_area_1000ha",
+  "Land area equipped for irrigation" = "equipped_irrig_1000ha",
+  "Land area actually irrigated"      = "actual_irrig_1000ha",
+  "Cropland area actually irrigated"  = "cropland_irrig_1000ha")
+
+irrig_iso$col_name <- item_to_col[irrig_iso$Item]
+
+irrig_wide <- irrig_iso %>%
+  dplyr::group_by(Country_ISO, Year, col_name) %>%
+  dplyr::summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = col_name, values_from = Value) %>%
+  as.data.frame()
+
+for (k in item_to_col) {
+  if (!k %in% names(irrig_wide)) irrig_wide[[k]] <- NA_real_
+}
+
+irrig_wide <- irrig_wide %>%
+  dplyr::mutate(
+    irrig_share = ifelse(
+      !is.na(land_area_1000ha) & land_area_1000ha > 0,
+      actual_irrig_1000ha / land_area_1000ha, NA_real_),
+    cropland_irrig_share = ifelse(
+      !is.na(land_area_1000ha) & land_area_1000ha > 0,
+      cropland_irrig_1000ha / land_area_1000ha, NA_real_),
+    irrig_intensity = ifelse(
+      !is.na(equipped_irrig_1000ha) & equipped_irrig_1000ha > 0,
+      pmin(actual_irrig_1000ha / equipped_irrig_1000ha, 1), NA_real_))
+
+for (crop_name in names(crop_config)) {
+  panelv3_path <- file.path(base_dir, paste0("panelv3_", crop_name, ".xlsx"))
+  panelv4_path <- file.path(base_dir, paste0("panelv4_", crop_name, ".xlsx"))
+  cat("---", toupper(crop_name), "---\n")
+  if (!file.exists(panelv3_path)) { cat("  [ERROR] panelv3 missing\n\n"); next }
+  
+  panelv3   <- as.data.frame(readxl::read_excel(panelv3_path))
+  year_col  <- if ("Yil" %in% names(panelv3)) "Yil" else "Year"
+  
+  panelv4 <- panelv3 %>%
+    dplyr::left_join(
+      irrig_wide[, c("Country_ISO","Year",
+                     "land_area_1000ha","equipped_irrig_1000ha",
+                     "actual_irrig_1000ha","cropland_irrig_1000ha",
+                     "irrig_share","cropland_irrig_share","irrig_intensity")],
+      by = setNames(c("Country_ISO","Year"),
+                    c("Country_ISO", year_col)),
+      relationship = "many-to-one")
+  
+  writexl::write_xlsx(panelv4, panelv4_path)
+  cat("  [SAVED]", basename(panelv4_path), "\n\n")
+  rm(panelv3, panelv4); gc()
+}
+
+
+# ==============================================================================
+# STEP 5 -- CROPLAND AREA + irr_ratio -> panelv5
+#
+# irr_ratio = equipped_irrig_1000ha / cropland_area_1000ha
+# This is the main irrigation variable used in the TWFE models.
+# If cropland is NA: fallback to land_area as denominator.
+# ==============================================================================
+
+cat("\n", strrep("=", 60), "\nSTEP 5: Cropland + irr_ratio -> panelv5_*\n",
+    strrep("=", 60), "\n\n")
+
+cropland_df <- NULL
+
+if (requireNamespace("FAOSTAT", quietly = TRUE)) {
+  cat("[*] Fetching cropland via FAOSTAT package...\n")
+  tryCatch({
+    library(FAOSTAT)
+    raw <- FAOSTAT::get_faostat_item(
+      item_code    = "6620",
+      element_code = "5110",
+      domain_code  = "RL")
+    names(raw)     <- tolower(gsub("[^a-zA-Z0-9]", "_", names(raw)))
+    iso_col        <- grep("iso|area_code", names(raw), value = TRUE)[1]
+    year_col       <- grep("^year$|^yil$",  names(raw), value = TRUE)[1]
+    val_col        <- grep("^value$",       names(raw), value = TRUE)[1]
+    cropland_df    <- data.frame(
+      Country_ISO          = raw[[iso_col]],
+      Year                 = as.integer(raw[[year_col]]),
+      cropland_area_1000ha = as.numeric(
+        gsub(",", ".", as.character(raw[[val_col]]))))
+    cropland_df <- cropland_df[
+      !is.na(cropland_df$Country_ISO) &
+        !is.na(cropland_df$Year) &
+        cropland_df$Year >= 1961 &
+        cropland_df$Year <= 2024, ]
+    cat("[OK] Cropland:", nrow(cropland_df), "rows\n")
+  }, error = function(e) {
+    cat("[FALLBACK] FAOSTAT package failed:", conditionMessage(e), "\n")
+  })
+}
+
+if (is.null(cropland_df) || nrow(cropland_df) == 0) {
+  manual_paths <- c(
+    file.path(base_dir, "cropland.csv"),
+    file.path(base_dir, "cropland.xlsx"),
+    file.path(base_dir, "FAOSTAT_cropland.csv"))
+  found_path <- manual_paths[file.exists(manual_paths)]
+  if (length(found_path) > 0) {
+    file_to_use <- found_path[1]
+    cat("[FALLBACK] Using:", basename(file_to_use), "\n")
+    
+    # Read raw file (CSV or XLSX)
+    cropland_raw <- if (grepl("\\.csv$", file_to_use, ignore.case = TRUE))
+      as.data.frame(data.table::fread(file_to_use, encoding = "UTF-8"))
+    else
+      as.data.frame(readxl::read_excel(file_to_use))
+    names(cropland_raw) <- trimws(names(cropland_raw))
+    
+    # Expected shape: standard FAOSTAT bulk-download columns (Area, Year,
+    # Value, and usually Item/Element/Unit) -- same shape as fao_csv and
+    # irrigation_xl already used elsewhere in this script. If the actual
+    # file uses different column names, adjust the checks below.
+    required_cols <- c("Area", "Year", "Value")
+    missing_cols  <- setdiff(required_cols, names(cropland_raw))
+    if (length(missing_cols) > 0)
+      stop("cropland file is missing expected column(s): ",
+           paste(missing_cols, collapse = ", "),
+           " -- actual columns are: ", paste(names(cropland_raw), collapse = ", "),
+           " -- adjust the Step 5 fallback block to match")
+    
+    cropland_raw$Year  <- as.integer(gsub("'", "", as.character(cropland_raw$Year)))
+    cropland_raw$Value <- as.numeric(gsub(",", ".", as.character(cropland_raw$Value)))
+    
+    # If an Element column is present, keep only the cropland-area element
+    # (bulk FAOSTAT Land Use downloads may include multiple land-use series
+    # in one file)
+    if ("Element" %in% names(cropland_raw)) {
+      keep_elements <- c("Area", "Cropland")
+      cropland_raw  <- cropland_raw[cropland_raw$Element %in% keep_elements, ]
+    }
+    if ("Item" %in% names(cropland_raw)) {
+      cropland_raw <- cropland_raw[grepl("Cropland", cropland_raw$Item,
+                                         ignore.case = TRUE), ]
+    }
+    
+    # Fix Turkey / Cote d'Ivoire naming, same convention as FAO production data
+    cropland_raw$Area[grepl("rkiye|Turkey|TURKEY", cropland_raw$Area)] <-
+      iso_map$fao_area[iso_map$Country_ISO == "TUR"][1]
+    cropland_raw$Area[grepl("voire|Ivory", cropland_raw$Area, ignore.case = TRUE)] <-
+      iso_map$fao_area[iso_map$Country_ISO == "CIV"][1]
+    
+    # Map country name -> ISO using the iso_map already built in Section 3
+    # (same translation table used for fao_wide -- not a new/independent one)
+    cropland_merged <- merge(cropland_raw, iso_map,
+                             by.x = "Area", by.y = "fao_area", all.x = TRUE)
+    
+    unmatched_cropland <- sort(unique(
+      cropland_merged$Area[is.na(cropland_merged$Country_ISO)]))
+    if (length(unmatched_cropland) > 0) {
+      cat("[WARNING] cropland file area names with no ISO match (dropped):\n")
+      cat(" ", paste(unmatched_cropland, collapse = ", "), "\n")
+    }
+    
+    cropland_df <- data.frame(
+      Country_ISO          = cropland_merged$Country_ISO,
+      Year                 = cropland_merged$Year,
+      cropland_area_1000ha = cropland_merged$Value,
+      stringsAsFactors = FALSE)
+    cropland_df <- cropland_df[
+      !is.na(cropland_df$Country_ISO) &
+        !is.na(cropland_df$Year) &
+        cropland_df$Year >= 1961 & cropland_df$Year <= 2024, ]
+    
+    cat("[OK] Cropland (manual file):", nrow(cropland_df), "rows |",
+        length(unique(cropland_df$Country_ISO)), "countries\n")
+  } else {
+    stop("Cropland data not found. Download from FAOSTAT (item 6620) and save as cropland.csv")
+  }
+}
+
+cropland_df <- cropland_df[
+  !is.na(cropland_df$cropland_area_1000ha) &
+    cropland_df$cropland_area_1000ha > 0, ]
+
+# Collapse to exactly one row per Country_ISO x Year before the join below.
+# The manual file (or, if it ever works again, the FAOSTAT package path) can
+# contain multiple rows per country-year (e.g. several Item variants that
+# all match the "Cropland" name filter, such as "Cropland" and "Cropland,
+# irrigated"). left_join() requires a 1:1 or many:1 match, so this must be
+# resolved before joining onto the crop panels.
+n_before_dedup <- nrow(cropland_df)
+cropland_df <- cropland_df %>%
+  dplyr::group_by(Country_ISO, Year) %>%
+  dplyr::summarise(cropland_area_1000ha = mean(cropland_area_1000ha, na.rm = TRUE),
+                   .groups = "drop") %>%
+  as.data.frame()
+cat(sprintf("[OK] cropland_df deduplicated: %d -> %d rows (%d country-year pairs)\n",
+            n_before_dedup, nrow(cropland_df), nrow(cropland_df)))
+
+for (crop_name in names(crop_config)) {
+  panelv4_path <- file.path(base_dir, paste0("panelv4_", crop_name, ".xlsx"))
+  panelv5_path <- file.path(base_dir, paste0("panelv5_", crop_name, ".xlsx"))
+  cat("---", toupper(crop_name), "---\n")
+  if (!file.exists(panelv4_path)) { cat("  [ERROR] panelv4 missing\n\n"); next }
+  
+  panelv4  <- as.data.frame(readxl::read_excel(panelv4_path))
+  year_col <- if ("Yil" %in% names(panelv4)) "Yil" else "Year"
+  
+  panelv5 <- panelv4 %>%
+    dplyr::left_join(
+      cropland_df,
+      by = setNames(c("Country_ISO","Year"),
+                    c("Country_ISO", year_col)),
+      relationship = "many-to-one") %>%
+    dplyr::mutate(
+      # irr_ratio: equipped irrigation / cropland (preferred denominator)
+      # Falls back to land_area if cropland is missing
+      irr_ratio = dplyr::case_when(
+        !is.na(cropland_area_1000ha) & cropland_area_1000ha > 0
+        ~ pmin(equipped_irrig_1000ha / cropland_area_1000ha, 1),
+        !is.na(land_area_1000ha) & land_area_1000ha > 0
+        ~ pmin(equipped_irrig_1000ha / land_area_1000ha, 1),
+        TRUE ~ NA_real_),
+      irr_ratio_denom = dplyr::case_when(
+        !is.na(cropland_area_1000ha) & cropland_area_1000ha > 0 ~ "cropland",
+        !is.na(land_area_1000ha)     & land_area_1000ha > 0     ~ "land_area",
+        TRUE ~ NA_character_))
+  
+  # Winsorise: if equipped > cropland -> cap at 0.95
+  panelv5 <- panelv5 %>%
+    dplyr::mutate(
+      irr_ratio = ifelse(
+        !is.na(equipped_irrig_1000ha) &
+          !is.na(cropland_area_1000ha) &
+          equipped_irrig_1000ha > cropland_area_1000ha,
+        0.95, irr_ratio))
+  
+  writexl::write_xlsx(panelv5, panelv5_path)
+  cat("  [SAVED]", basename(panelv5_path), "\n\n")
+  rm(panelv4, panelv5); gc()
+}
+
+
+# ==============================================================================
+# STEP 6 -- ARIDITY INDEX (AI = PRE_ann / PET_ann) + is_arid -> panelv6
+#
+# Definition follows UNEP (1997) Aridity Index classification:
+#   AI < 0.05 : hyper-arid   | AI < 0.20 : arid
+#   AI < 0.50 : semi-arid    | AI < 0.65 : dry sub-humid
+# is_arid = 1 if AI < 0.50 (semi-arid and drier) -- the threshold commonly
+# used as the risk boundary for reliable rainfed cereal production.
+#
+# PET data quality is checked BEFORE the index is used anywhere downstream:
+#   (a) PET_ann should fall within a physically plausible range (0-3000 mm/yr)
+#   (b) count of PET_ann == 0 or NA observations is reported
+#   (c) the AI distribution is summarised (and can be plotted) to catch
+#       skew or implausible spikes before trusting is_arid in the models
+#
+# TWO aridity variables are produced here, for two different purposes:
+#   AI / is_arid            -- YEAR-VARYING (this country, this year's own
+#                              PRE_ann/PET_ann). Reflects short-run wet/dry
+#                              conditions, which overlaps heavily with PRE
+#                              itself -- appropriate for within-year
+#                              robustness checks, but NOT for classifying a
+#                              country as structurally arid vs humid.
+#   AI_baseline / is_arid_fixed -- TIME-INVARIANT (one fixed value per
+#                              country, from the 1990-2000 baseline window,
+#                              same fallback rule as the fixed-baseline weighting specification). This answers a
+#                              genuinely different question: does the same
+#                              temperature shock cause more damage in a
+#                              structurally arid country than a structurally
+#                              humid one? The fixed-aridity interaction specification (is_arid_fixed x TMX) uses
+#                              this fixed version so it is not just
+#                              re-measuring the precipitation x TMX interaction under another name.
+# ==============================================================================
+
+cat("\n", strrep("=", 60), "\nSTEP 6: Aridity Index + is_arid -> panelv6_*\n",
+    strrep("=", 60), "\n\n")
+
+AI_THRESHOLD <- 0.50   # semi-arid boundary, UNEP (1997)
+
+# -- PET sanity check, run once on the pooled panel before per-crop processing --
+cat("--- PET / AI sanity check (pooled across crops) ---\n")
+
+pet_check_list <- list()
+for (crop_name in names(crop_config)) {
+  panelv5_path <- file.path(base_dir, paste0("panelv5_", crop_name, ".xlsx"))
+  if (!file.exists(panelv5_path)) next
+  df_tmp <- as.data.frame(readxl::read_excel(panelv5_path))
+  if (!all(c("PRE_ann","PET_ann") %in% names(df_tmp))) next
+  pet_check_list[[crop_name]] <- df_tmp[, c("Country_ISO","Yil","PRE_ann","PET_ann")]
+}
+pet_pool <- dplyr::bind_rows(pet_check_list) %>% dplyr::distinct()
+
+n_total     <- nrow(pet_pool)
+n_pet_zero  <- sum(pet_pool$PET_ann == 0, na.rm = TRUE)
+n_pet_na    <- sum(is.na(pet_pool$PET_ann))
+n_pet_out   <- sum(!is.na(pet_pool$PET_ann) &
+                     (pet_pool$PET_ann < 0 | pet_pool$PET_ann > 3000))
+
+cat(sprintf("  Total pooled country-year rows : %d\n", n_total))
+cat(sprintf("  PET_ann == 0                   : %d (%.1f%%)\n",
+            n_pet_zero, 100 * n_pet_zero / n_total))
+cat(sprintf("  PET_ann == NA                  : %d (%.1f%%)\n",
+            n_pet_na, 100 * n_pet_na / n_total))
+cat(sprintf("  PET_ann outside [0, 3000] mm/yr: %d (%.1f%%)\n",
+            n_pet_out, 100 * n_pet_out / n_total))
+
+pet_pool$AI_check <- ifelse(pet_pool$PET_ann > 0,
+                            pet_pool$PRE_ann / pet_pool$PET_ann, NA_real_)
+cat("\n  AI (PRE_ann / PET_ann) summary:\n")
+print(summary(pet_pool$AI_check))
+cat(sprintf("  AI outside [0, 5] (implausible): %d rows\n",
+            sum(!is.na(pet_pool$AI_check) &
+                  (pet_pool$AI_check < 0 | pet_pool$AI_check > 5))))
+
+cat("\n  [NOTE] If PET_ann == 0/NA rate or AI outlier rate is high (e.g. >10%),\n")
+cat("         reconsider is_arid definition (e.g. fall back to PRE_ann < 400mm)\n")
+cat("         before using is_arid or its interaction (is_arid x TMX) in models.\n\n")
+
+rm(pet_check_list, pet_pool); gc()
+
+# -- Helper: fixed (time-invariant) baseline AI per country --------------------
+# Same baseline-window + fallback logic as the fixed-baseline production/area weights
+# (Step 7 below), applied here to PRE_ann/PET_ann instead. Uses ratio of
+# baseline-period means (not mean of yearly ratios), which is more robust
+# to any single unusually wet/dry year within the baseline window.
+compute_fixed_aridity <- function(df) {
+  df %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::group_modify(function(sub, key) {
+      in_window <- sub[sub$Yil >= BASELINE_START & sub$Yil <= BASELINE_END, ]
+      
+      if (nrow(in_window) >= 1) {
+        used_years  <- sort(in_window$Yil)
+        base_pre    <- mean(in_window$PRE_ann, na.rm = TRUE)
+        base_pet    <- mean(in_window$PET_ann, na.rm = TRUE)
+        is_fallback <- 0L
+      } else {
+        sub_sorted    <- sub[order(sub$Yil), ]
+        take_n        <- min(BASELINE_LEN, nrow(sub_sorted))
+        fallback_rows <- sub_sorted[seq_len(take_n), ]
+        used_years    <- sort(fallback_rows$Yil)
+        base_pre      <- mean(fallback_rows$PRE_ann, na.rm = TRUE)
+        base_pet      <- mean(fallback_rows$PET_ann, na.rm = TRUE)
+        is_fallback   <- 1L
+      }
+      
+      ai_baseline <- if (!is.na(base_pet) && base_pet > 0) base_pre / base_pet else NA_real_
+      period_label <- if (length(used_years) == 0) NA_character_ else
+        paste0(min(used_years), "-", max(used_years))
+      
+      data.frame(
+        AI_baseline                  = ai_baseline,
+        is_arid_fixed                = ifelse(is.na(ai_baseline), NA_integer_,
+                                              as.integer(ai_baseline < AI_THRESHOLD)),
+        aridity_baseline_period_used = period_label,
+        aridity_baseline_is_fallback = is_fallback,
+        stringsAsFactors = FALSE)
+    }) %>%
+    dplyr::ungroup()
+}
+
+# -- Apply AI + is_arid (year-varying) and AI_baseline + is_arid_fixed ---------
+# (time-invariant) to each crop panel ------------------------------------------
+
+for (crop_name in names(crop_config)) {
+  panelv5_path <- file.path(base_dir, paste0("panelv5_", crop_name, ".xlsx"))
+  panelv6_path <- file.path(base_dir, paste0("panelv6_", crop_name, ".xlsx"))
+  cat("---", toupper(crop_name), "---\n")
+  if (!file.exists(panelv5_path)) { cat("  [ERROR] panelv5 missing\n\n"); next }
+  
+  panelv5 <- as.data.frame(readxl::read_excel(panelv5_path))
+  if (!all(c("PRE_ann","PET_ann") %in% names(panelv5))) {
+    cat("  [ERROR] PRE_ann/PET_ann column missing\n\n"); next
+  }
+  
+  panelv5$irr_ratio <- pmin(panelv5$irr_ratio, 1.0)   # ensure cap at 1
+  
+  panelv6 <- panelv5 %>%
+    dplyr::mutate(
+      AI = dplyr::case_when(
+        is.na(PET_ann) | PET_ann <= 0 ~ NA_real_,
+        TRUE ~ PRE_ann / PET_ann),
+      is_arid = dplyr::case_when(
+        is.na(AI)        ~ NA_real_,
+        AI < AI_THRESHOLD ~ 1,
+        TRUE              ~ 0))
+  
+  fixed_aridity <- compute_fixed_aridity(panelv6[, c("Country_ISO","Yil","PRE_ann","PET_ann")])
+  panelv6 <- panelv6 %>%
+    dplyr::select(-dplyr::any_of(c("AI_baseline","is_arid_fixed",
+                                   "aridity_baseline_period_used",
+                                   "aridity_baseline_is_fallback"))) %>%
+    dplyr::left_join(fixed_aridity, by = "Country_ISO")
+  
+  n_fallback_arid <- length(unique(
+    panelv6$Country_ISO[panelv6$aridity_baseline_is_fallback == 1]))
+  
+  writexl::write_xlsx(panelv6, panelv6_path)
+  cat("  [SAVED]", basename(panelv6_path),
+      "| is_arid=1 (year-varying):", sum(panelv6$is_arid == 1, na.rm = TRUE), "rows",
+      "| is_arid_fixed=1 (countries):",
+      length(unique(panelv6$Country_ISO[panelv6$is_arid_fixed == 1])),
+      "| baseline fallback used for", n_fallback_arid, "countries\n\n")
+  rm(panelv5, panelv6, fixed_aridity); gc()
+}
+
+
+# ==============================================================================
+# STEP 7 -- GDP PER CAPITA (World Bank WDI) -> panelv7 (final output)
+#
+# Variable: NY.GDP.PCAP.KD (constant 2015 USD per capita)
+# Fallback: PPP-adjusted GDP if constant USD missing
+# Interpolation: linear within-country interpolation for remaining gaps
+# Also fixes WDI's backfilled early-year constant sequences and removes
+# duplicate Country_ISO x Yil rows.
+# ==============================================================================
+
+cat("\n", strrep("=", 60), "\nSTEP 7: GDP per capita -> panelv7_* (final)\n",
+    strrep("=", 60), "\n\n")
+
+if (!requireNamespace("WDI", quietly = TRUE)) install.packages("WDI")
+library(WDI)
+
+cat("[*] Downloading GDP from World Bank WDI...\n")
+gdp_raw <- WDI::WDI(
+  indicator = "NY.GDP.PCAP.KD",
+  country   = "all",
+  start     = 1961, end = 2024,
+  extra     = TRUE)
+
+gdp_raw <- gdp_raw[
+  !is.na(gdp_raw$iso3c) & gdp_raw$iso3c != "" &
+    (is.na(gdp_raw$region) | gdp_raw$region != "Aggregates"), ]
+
+cat("[OK] Downloaded. Range: min =",
+    round(min(gdp_raw$NY.GDP.PCAP.KD, na.rm = TRUE), 0),
+    "max =", round(max(gdp_raw$NY.GDP.PCAP.KD, na.rm = TRUE), 0),
+    "USD\n")
+
+iso_fix <- c("ROM" = "ROU", "ZAR" = "COD", "TMP" = "TLS",
+             "YUG" = "SRB", "CSK" = "CZE")
+
+gdp_clean <- data.frame(
+  Country_ISO    = dplyr::recode(gdp_raw$iso3c, !!!iso_fix),
+  Yil            = as.integer(gdp_raw$year),
+  GDP_per_Capita = as.numeric(gdp_raw$NY.GDP.PCAP.KD),
+  stringsAsFactors = FALSE) %>%
+  dplyr::filter(!is.na(GDP_per_Capita), Yil >= 1961, Yil <= 2024) %>%
+  dplyr::group_by(Country_ISO, Yil) %>%
+  dplyr::summarise(GDP_per_Capita = mean(GDP_per_Capita, na.rm = TRUE),
+                   .groups = "drop")
+
+# Supplement with PPP-adjusted GDP where constant USD missing
+gdp_ppp_raw <- tryCatch(
+  WDI::WDI(indicator = "NY.GDP.PCAP.PP.KD",
+           country = "all", start = 1961, end = 2024, extra = TRUE),
+  error = function(e) NULL)
+
+if (!is.null(gdp_ppp_raw)) {
+  gdp_ppp_raw <- gdp_ppp_raw[
+    !is.na(gdp_ppp_raw$iso3c) & gdp_ppp_raw$iso3c != "" &
+      (is.na(gdp_ppp_raw$region) | gdp_ppp_raw$region != "Aggregates"), ]
+  gdp_ppp <- data.frame(
+    Country_ISO = gdp_ppp_raw$iso3c,
+    Yil         = as.integer(gdp_ppp_raw$year),
+    GDP_ppp     = as.numeric(gdp_ppp_raw$NY.GDP.PCAP.PP.KD),
+    stringsAsFactors = FALSE) %>%
+    dplyr::filter(!is.na(GDP_ppp), Yil >= 1961, Yil <= 2024) %>%
+    dplyr::group_by(Country_ISO, Yil) %>%
+    dplyr::summarise(GDP_ppp = mean(GDP_ppp, na.rm = TRUE), .groups = "drop")
+  
+  gdp_clean <- gdp_clean %>%
+    dplyr::full_join(gdp_ppp, by = c("Country_ISO","Yil")) %>%
+    dplyr::mutate(
+      GDP_per_Capita = dplyr::case_when(
+        !is.na(GDP_per_Capita) ~ GDP_per_Capita,
+        !is.na(GDP_ppp)        ~ GDP_ppp,
+        TRUE                   ~ NA_real_)) %>%
+    dplyr::select(-GDP_ppp) %>%
+    dplyr::filter(!is.na(GDP_per_Capita))
+}
+
+# Within-country linear interpolation to fill remaining gaps
+# Within-country linear interpolation: fills GAPS between two real WDI
+# observations. rule = 1 (NOT 2) deliberately leaves years OUTSIDE a
+# country's genuinely observed WDI range as NA, rather than extrapolating
+# the nearest real value forward/backward indefinitely. rule = 2 was found
+# to silently hold GDP_per_Capita constant for a decade or more in
+# countries with real WDI coverage gaps (e.g. Eritrea 2011-2024, Yemen
+# 2018-2024 -- both conflict/data-collection-crisis periods), which is a
+# pipeline-introduced artifact, not real WDI data. With rule = 1, GDP
+# interpolation is confined to each country's genuinely observed WDI
+# coverage window; no extrapolation beyond the last/first real observation.
+full_grid <- expand.grid(
+  Country_ISO = unique(gdp_clean$Country_ISO),
+  Yil         = 1961:2024,
+  stringsAsFactors = FALSE)
+
+gdp_full <- full_grid %>%
+  dplyr::left_join(gdp_clean, by = c("Country_ISO","Yil")) %>%
+  dplyr::group_by(Country_ISO) %>%
+  dplyr::mutate(
+    n_observed = sum(!is.na(GDP_per_Capita)),
+    GDP_per_Capita = ifelse(
+      n_observed >= 2,
+      approx(x    = Yil[!is.na(GDP_per_Capita)],
+             y    = GDP_per_Capita[!is.na(GDP_per_Capita)],
+             xout = Yil,
+             rule = 1)$y,   # rule=1: NA outside observed range (no extrapolation)
+      GDP_per_Capita)) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-n_observed) %>%
+  dplyr::filter(!is.na(GDP_per_Capita))
+
+cat("[OK] GDP full grid:", nrow(gdp_full), "rows |",
+    length(unique(gdp_full$Country_ISO)), "countries\n")
+
+# Function: remove backfilled GDP values (constant run at start of series)
+remove_gdp_backfill <- function(df) {
+  df %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::arrange(Yil, .by_group = TRUE) %>%
+    dplyr::mutate(
+      GDP_per_Capita = (function(x) {
+        result   <- x
+        non_na   <- which(!is.na(x))
+        if (length(non_na) < 2) return(result)
+        first_change <- NA_integer_
+        for (k in 2:length(non_na)) {
+          if (x[non_na[k]] != x[non_na[k - 1]]) {
+            first_change <- non_na[k - 1]; break
+          }
+        }
+        if (is.na(first_change)) { result[] <- NA; return(result) }
+        if (first_change > 1) result[1:(first_change - 1)] <- NA
+        result
+      })(GDP_per_Capita)) %>%
+    dplyr::ungroup()
+}
+
+for (crop_name in names(crop_config)) {
+  panelv6_path <- file.path(base_dir, paste0("panelv6_", crop_name, ".xlsx"))
+  panelv7_path <- file.path(base_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  cat("---", toupper(crop_name), "---\n")
+  if (!file.exists(panelv6_path)) { cat("  [ERROR] panelv6 missing\n\n"); next }
+  
+  panelv6  <- as.data.frame(readxl::read_excel(panelv6_path))
+  year_col <- if ("Yil" %in% names(panelv6)) "Yil" else "Year"
+  
+  # Drop old fallback GDP (may be incorrect), replace with WDI
+  panelv6$GDP_per_Capita <- NULL
+  
+  panelv7 <- panelv6 %>%
+    dplyr::left_join(
+      gdp_full[, c("Country_ISO","Yil","GDP_per_Capita")],
+      by = setNames(c("Country_ISO","Yil"),
+                    c("Country_ISO", year_col)))
+  
+  panelv7$Yil <- as.integer(as.character(panelv7$Yil))
+  panelv7 <- remove_gdp_backfill(panelv7)
+  
+  # Remove duplicate Country_ISO x Yil rows (keep row with most data)
+  dup_check <- panelv7 %>%
+    dplyr::group_by(Country_ISO, Yil) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::filter(n > 1)
+  
+  if (nrow(dup_check) > 0) {
+    cat("  [", crop_name, "]", nrow(dup_check), "duplicate pairs -- removing\n")
+    panelv7 <- panelv7 %>%
+      dplyr::group_by(Country_ISO, Yil) %>%
+      dplyr::arrange(
+        dplyr::desc(!is.na(GDP_per_Capita)),
+        dplyr::desc(!is.na(production_tonnes))) %>%
+      dplyr::slice(1) %>%
+      dplyr::ungroup()
+  }
+  
+  # -- Fixed-baseline production/area weights -------------------------------
+  # Same baseline-window + fallback logic as the fixed aridity
+  # classification in Step 6 (BASELINE_START/END, same fallback rule):
+  # a country's fixed-baseline weight is its own 1990-2000 average production/area,
+  # or -- if it has no data at all in that window -- the average of its
+  # own earliest available years instead. The resulting weight is fixed
+  # (identical across all years of that country), documented via
+  # baseline_period_used and baseline_is_fallback.
+  baseline_vals <- panelv7 %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::group_modify(function(sub, key) {
+      in_window <- sub[sub$Yil >= BASELINE_START & sub$Yil <= BASELINE_END, ]
+      
+      if (nrow(in_window) >= 1) {
+        used_years  <- sort(in_window$Yil)
+        base_prod   <- mean(in_window$production_tonnes, na.rm = TRUE)
+        base_area   <- mean(in_window$area_harvested_ha, na.rm = TRUE)
+        is_fallback <- 0L
+      } else {
+        sub_sorted    <- sub[order(sub$Yil), ]
+        take_n        <- min(BASELINE_LEN, nrow(sub_sorted))
+        fallback_rows <- sub_sorted[seq_len(take_n), ]
+        used_years    <- sort(fallback_rows$Yil)
+        base_prod     <- mean(fallback_rows$production_tonnes, na.rm = TRUE)
+        base_area     <- mean(fallback_rows$area_harvested_ha, na.rm = TRUE)
+        is_fallback   <- 1L
+      }
+      
+      period_label <- if (length(used_years) == 0) NA_character_ else
+        paste0(min(used_years), "-", max(used_years))
+      
+      data.frame(
+        baseline_production_tonnes = base_prod,
+        baseline_area_harvested_ha = base_area,
+        baseline_period_used       = period_label,
+        baseline_is_fallback       = is_fallback,
+        stringsAsFactors = FALSE)
+    }) %>%
+    dplyr::ungroup()
+  
+  panelv7 <- panelv7 %>%
+    dplyr::left_join(baseline_vals, by = "Country_ISO")
+  
+  n_fallback_baseline <- length(unique(
+    panelv7$Country_ISO[panelv7$baseline_is_fallback == 1]))
+  
+  writexl::write_xlsx(panelv7, panelv7_path)
+  cat("  [SAVED]", basename(panelv7_path),
+      "| GDP filled:", sum(!is.na(panelv7$GDP_per_Capita)),
+      "| GDP NA:", sum(is.na(panelv7$GDP_per_Capita)),
+      "| Fixed-baseline fallback used for", n_fallback_baseline, "countries\n\n")
+  rm(panelv6, panelv7, baseline_vals); gc()
+}
+
+
+# ==============================================================================
+# FINAL SUMMARY -- panelv7_* overview
+# ==============================================================================
+
+cat("\n", strrep("=", 70), "\nFINAL SUMMARY -- panelv7_* (ready for modelling)\n",
+    strrep("=", 70), "\n")
+cat(sprintf("%-10s %5s %5s  %5s  %5s  %6s  %6s  %8s\n",
+            "Crop","N","Ctry","IRN","EGY","GDP_NA%","Arid%","AridFix%"))
+cat(strrep("-", 70), "\n")
+
+for (crop_name in names(crop_config)) {
+  pf <- file.path(base_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  if (!file.exists(pf)) { cat(sprintf("%-10s  [MISSING]\n", crop_name)); next }
+  df <- as.data.frame(readxl::read_excel(pf))
+  n_countries <- length(unique(df$Country_ISO))
+  n_arid_fixed_countries <- length(unique(
+    df$Country_ISO[!is.na(df$is_arid_fixed) & df$is_arid_fixed == 1]))
+  cat(sprintf("%-10s %5d %5d  %5d  %5d  %5.0f%%  %5.0f%%  %6.0f%%\n",
+              crop_name,
+              nrow(df),
+              n_countries,
+              sum(df$Country_ISO == "IRN"),
+              sum(df$Country_ISO == "EGY"),
+              mean(is.na(df$GDP_per_Capita)) * 100,
+              mean(df$is_arid == 1, na.rm = TRUE) * 100,
+              100 * n_arid_fixed_countries / n_countries))
+}
+cat("\n[NOTE] Arid% = share of country-YEARS classified arid (year-varying AI).\n")
+cat("       AridFix% = share of COUNTRIES classified arid on their fixed\n")
+cat("       1990-2000 (or fallback) baseline AI -- this is the version used\n")
+cat("       in the fixed-aridity interaction specification (is_arid_fixed x TMX).\n\n")
+
+cat("\n[Pipeline complete]\n")
+cat("[Output files] panelv7_wheat.xlsx ... panelv7_sorghum.xlsx\n")
+cat("[Next step]    Model estimation script (annual TMX/PRE, no phenology, no VPD)\n\n")
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# DATA CHECK -- diagnostics only, no data is created or modified here
+#
+# Reads the existing panelv1_* ... panelv7_* files produced by the data
+# preparation script and reports:
+#   1. Country coverage across the panelv1 -> panelv7 chain (where countries
+#      are lost, and at which stage)
+#   2. TMX_ann plausibility (range, extreme values flagged)
+#   3. PRE_ann plausibility (range, extreme values flagged)
+#   4. Missing-data rates per key variable, per crop
+#   5. Years-per-country distribution (to check the MIN_YEARS=10 cutoff)
+#   6. Duplicate Country_ISO x Yil rows in the final panelv7 files
+#
+# This script does not write any panelv*_ file. It only reads and reports.
+# ==============================================================================
+
+library(dplyr)
+library(readxl)
+library(writexl)
+
+base_dir     <- "C:/Users/Alper.Tosun/Desktop/cru130"
+crop_names   <- c("wheat","barley","oats","rye","rice","maize","soybean","sorghum")
+panel_stages <- c("panelv1","panelv2","panelv3","panelv4",
+                  "panelv5","panelv6","panelv7")
+
+read_panel <- function(stage, crop_name) {
+  f <- file.path(base_dir, paste0(stage, "_", crop_name, ".xlsx"))
+  if (!file.exists(f)) return(NULL)
+  as.data.frame(readxl::read_excel(f))
+}
+
+
+# ==============================================================================
+# 1. COUNTRY COVERAGE ACROSS THE PANEL CHAIN
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("1. COUNTRY COVERAGE -- panelv1 -> panelv7\n")
+cat(strrep("=", 70), "\n\n")
+
+coverage_rows <- list()
+
+for (crop_name in crop_names) {
+  n_countries <- c()
+  for (stage in panel_stages) {
+    df <- read_panel(stage, crop_name)
+    n_countries[stage] <- if (is.null(df)) NA_integer_ else
+      length(unique(df$Country_ISO))
+  }
+  coverage_rows[[crop_name]] <- c(crop = crop_name, n_countries)
+  cat(sprintf("[%-8s] ", crop_name))
+  cat(paste(sprintf("%s=%s", panel_stages, n_countries), collapse = " | "))
+  cat("\n")
+}
+
+coverage_df <- as.data.frame(do.call(rbind, coverage_rows), stringsAsFactors = FALSE)
+cat("\n[NOTE] A large drop between panelv6 and panelv7 usually means many\n")
+cat("       countries lost GDP data entirely (unlikely) or lost the\n")
+cat("       MIN_YEARS >= 10 filter applied upstream in panelv2.\n\n")
+
+
+# ==============================================================================
+# 2 & 3. TMX_ann / PRE_ann PLAUSIBILITY CHECK (on final panelv7)
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("2-3. TMX_ann / PRE_ann PLAUSIBILITY CHECK (panelv7)\n")
+cat(strrep("=", 70), "\n\n")
+
+# Physically implausible bounds -- flag, do not silently drop
+TMX_LOW  <- -20   # degC, implausible annual mean flowering/annual max temp
+TMX_HIGH <-  45   # degC
+PRE_LOW  <-   0   # mm, precipitation cannot be negative
+PRE_HIGH <- 5000   # mm/yr, implausible for country-level annual mean
+
+tmx_pre_flags <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel("panelv7", crop_name)
+  if (is.null(df)) { cat(sprintf("[%s] panelv7 missing\n", crop_name)); next }
+  if (!all(c("TMX_ann","PRE_ann") %in% names(df))) {
+    cat(sprintf("[%s] TMX_ann/PRE_ann column missing\n", crop_name)); next
+  }
+  
+  cat(sprintf("[%-8s] TMX_ann: min=%.1f  mean=%.1f  max=%.1f  | PRE_ann: min=%.0f  mean=%.0f  max=%.0f\n",
+              crop_name,
+              min(df$TMX_ann, na.rm = TRUE), mean(df$TMX_ann, na.rm = TRUE),
+              max(df$TMX_ann, na.rm = TRUE),
+              min(df$PRE_ann, na.rm = TRUE), mean(df$PRE_ann, na.rm = TRUE),
+              max(df$PRE_ann, na.rm = TRUE)))
+  
+  tmx_bad <- df[!is.na(df$TMX_ann) &
+                  (df$TMX_ann < TMX_LOW | df$TMX_ann > TMX_HIGH),
+                c("Country_ISO","Yil","TMX_ann")]
+  pre_bad <- df[!is.na(df$PRE_ann) &
+                  (df$PRE_ann < PRE_LOW | df$PRE_ann > PRE_HIGH),
+                c("Country_ISO","Yil","PRE_ann")]
+  
+  if (nrow(tmx_bad) > 0) {
+    cat(sprintf("  [FLAG] %d rows with TMX_ann outside [%d, %d] degC:\n",
+                nrow(tmx_bad), TMX_LOW, TMX_HIGH))
+    print(head(tmx_bad[order(tmx_bad$TMX_ann), ], 10))
+    tmx_pre_flags[[paste0(crop_name, "_TMX")]] <-
+      cbind(crop = crop_name, variable = "TMX_ann", tmx_bad %>%
+              dplyr::rename(value = TMX_ann))
+  }
+  if (nrow(pre_bad) > 0) {
+    cat(sprintf("  [FLAG] %d rows with PRE_ann outside [%d, %d] mm:\n",
+                nrow(pre_bad), PRE_LOW, PRE_HIGH))
+    print(head(pre_bad[order(-pre_bad$PRE_ann), ], 10))
+    tmx_pre_flags[[paste0(crop_name, "_PRE")]] <-
+      cbind(crop = crop_name, variable = "PRE_ann", pre_bad %>%
+              dplyr::rename(value = PRE_ann))
+  }
+  if (nrow(tmx_bad) == 0 && nrow(pre_bad) == 0)
+    cat("  [OK] no implausible TMX_ann / PRE_ann values\n")
+  cat("\n")
+}
+
+flagged_df <- dplyr::bind_rows(tmx_pre_flags)
+
+
+# ==============================================================================
+# 4. MISSING-DATA RATES PER KEY VARIABLE, PER CROP (panelv7)
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("4. MISSING-DATA RATES (panelv7)\n")
+cat(strrep("=", 70), "\n\n")
+
+key_vars <- c("yield_hg_per_ha","production_tonnes","area_harvested_ha",
+              "TMX_ann","PRE_ann","PET_ann","VAP_ann","TMP_ann",
+              "AI","is_arid","irr_ratio","GDP_per_Capita","CO2_ppm")
+
+missing_rows <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel("panelv7", crop_name)
+  if (is.null(df)) next
+  for (v in key_vars) {
+    na_pct <- if (v %in% names(df)) round(mean(is.na(df[[v]])) * 100, 1) else NA_real_
+    missing_rows[[paste0(crop_name, "_", v)]] <- data.frame(
+      crop = crop_name, variable = v, na_pct = na_pct, stringsAsFactors = FALSE)
+  }
+}
+
+missing_df <- dplyr::bind_rows(missing_rows)
+
+cat("--- Missing rate by crop x variable (%) ---\n")
+missing_wide <- missing_df %>%
+  tidyr::pivot_wider(names_from = variable, values_from = na_pct)
+print(missing_wide, row.names = FALSE)
+
+cat("\n--- Variables with > 20% missing (flagged) ---\n")
+high_missing <- missing_df[!is.na(missing_df$na_pct) & missing_df$na_pct > 20, ]
+if (nrow(high_missing) > 0) {
+  print(high_missing[order(-high_missing$na_pct), ], row.names = FALSE)
+} else {
+  cat("  [OK] no variable exceeds 20% missing in any crop\n")
+}
+cat("\n")
+
+
+# ==============================================================================
+# 5. YEARS-PER-COUNTRY DISTRIBUTION (checks the MIN_YEARS = 10 cutoff)
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("5. YEARS-PER-COUNTRY DISTRIBUTION (panelv7)\n")
+cat(strrep("=", 70), "\n\n")
+
+years_summary_rows <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel("panelv7", crop_name)
+  if (is.null(df)) next
+  
+  year_counts <- df %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::summarise(n_years = dplyr::n(), .groups = "drop")
+  
+  cat(sprintf("[%-8s] countries=%d | years/country: min=%d  median=%.0f  max=%d\n",
+              crop_name, nrow(year_counts),
+              min(year_counts$n_years), median(year_counts$n_years),
+              max(year_counts$n_years)))
+  cat(sprintf("           <10 years: %d ctry | 10-20: %d ctry | 20-40: %d ctry | >40: %d ctry\n",
+              sum(year_counts$n_years < 10),
+              sum(year_counts$n_years >= 10 & year_counts$n_years < 20),
+              sum(year_counts$n_years >= 20 & year_counts$n_years < 40),
+              sum(year_counts$n_years >= 40)))
+  
+  years_summary_rows[[crop_name]] <- year_counts %>%
+    dplyr::mutate(crop = crop_name)
+}
+
+years_summary_df <- dplyr::bind_rows(years_summary_rows)
+
+cat("\n[NOTE] Countries with <10 years should already be excluded by the\n")
+cat("       MIN_YEARS filter applied in panelv2 (Step 2). If any remain\n")
+cat("       here with <10 years, check whether the filter was re-applied\n")
+cat("       correctly after Step 3 (extra-country patch), since patched\n")
+cat("       countries are appended after the original MIN_YEARS filter.\n\n")
+
+
+# ==============================================================================
+# 6. DUPLICATE Country_ISO x Yil ROWS (panelv7, final check)
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("6. DUPLICATE Country_ISO x Yil CHECK (panelv7)\n")
+cat(strrep("=", 70), "\n\n")
+
+dup_rows <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel("panelv7", crop_name)
+  if (is.null(df)) next
+  
+  dup <- df %>%
+    dplyr::group_by(Country_ISO, Yil) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::filter(n > 1)
+  
+  if (nrow(dup) > 0) {
+    cat(sprintf("[%s] %d duplicate Country_ISO x Yil pairs:\n", crop_name, nrow(dup)))
+    print(head(dup, 10))
+    dup_rows[[crop_name]] <- dup %>% dplyr::mutate(crop = crop_name)
+  } else {
+    cat(sprintf("[%-8s] [OK] no duplicates\n", crop_name))
+  }
+}
+
+dup_df <- dplyr::bind_rows(dup_rows)
+cat("\n")
+
+
+# ==============================================================================
+# SAVE DIAGNOSTIC REPORT
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("SAVING DIAGNOSTIC REPORT\n")
+cat(strrep("=", 70), "\n\n")
+
+report_sheets <- list(
+  Coverage_by_stage   = coverage_df,
+  Missing_rate_wide   = missing_wide,
+  Years_per_country   = years_summary_df
+)
+
+if (nrow(flagged_df) > 0) report_sheets[["Implausible_TMX_PRE"]] <- flagged_df
+if (nrow(dup_df) > 0)     report_sheets[["Duplicate_rows"]]      <- dup_df
+
+writexl::write_xlsx(report_sheets,
+                    file.path(base_dir, "data_check_report.xlsx"))
+cat("[SAVED] data_check_report.xlsx\n")
+cat("  Sheets:", paste(names(report_sheets), collapse = ", "), "\n\n")
+
+cat(strrep("=", 70), "\n")
+cat("DATA CHECK COMPLETE -- no panelv*_ file was modified\n")
+cat(strrep("=", 70), "\n")
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# CHECK -- AI / PET_ann / is_arid diagnostic (all crops)
+#
+# Investigates why is_arid = 1 (AI < 0.50, semi-arid and drier) shows up in
+# only 0-2% of country-year rows across all 8 crops, which is suspiciously
+# low given that a large share of global agricultural land (Middle East,
+# North Africa, Central Asia, parts of Southern Africa) is semi-arid or
+# drier under the UNEP (1997) classification.
+#
+# Checks:
+#   1. PET_ann plausibility (range, zero/NA rate) -- same checks as the
+#      Step 6 sanity block, but reported per crop here instead of pooled
+#   2. AI = PRE_ann / PET_ann distribution per crop
+#   3. is_arid proportion per crop, and whether it is internally consistent
+#      with the AI values actually stored (is_arid should be 1 exactly
+#      when AI < 0.50)
+#   4. Country-level mean AI for a set of countries that are unambiguously
+#      arid/semi-arid on any definition (Gulf states, North Africa, etc.)
+#      -- if these show as non-arid, that is a strong signal something is
+#      still wrong upstream (PET units, weighting, or the AI formula)
+#
+# Does not modify any panelv*_ file. Read-only diagnostic.
+# ==============================================================================
+
+library(dplyr)
+library(readxl)
+library(writexl)
+
+base_dir   <- "C:/Users/Alper.Tosun/Desktop/cru130"
+crop_names <- c("wheat","barley","oats","rye","rice","maize","soybean","sorghum")
+
+read_panel <- function(crop_name) {
+  f <- file.path(base_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  if (!file.exists(f)) return(NULL)
+  as.data.frame(readxl::read_excel(f))
+}
+
+
+# ==============================================================================
+# 1. PET_ann PLAUSIBILITY, PER CROP
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("1. PET_ann PLAUSIBILITY (per crop)\n")
+cat(strrep("=", 70), "\n\n")
+
+pet_summary <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel(crop_name)
+  if (is.null(df) || !"PET_ann" %in% names(df)) {
+    cat(sprintf("[%s] panelv7 missing or no PET_ann column\n", crop_name)); next
+  }
+  
+  n_total  <- nrow(df)
+  n_zero   <- sum(df$PET_ann == 0, na.rm = TRUE)
+  n_na     <- sum(is.na(df$PET_ann))
+  n_out    <- sum(!is.na(df$PET_ann) & (df$PET_ann < 0 | df$PET_ann > 3000))
+  
+  cat(sprintf("[%-8s] PET_ann: min=%.1f  mean=%.1f  max=%.1f  | zero=%d (%.1f%%) | NA=%d (%.1f%%) | outside[0,3000]=%d\n",
+              crop_name,
+              min(df$PET_ann, na.rm = TRUE), mean(df$PET_ann, na.rm = TRUE),
+              max(df$PET_ann, na.rm = TRUE),
+              n_zero, 100 * n_zero / n_total,
+              n_na,   100 * n_na   / n_total,
+              n_out))
+  
+  pet_summary[[crop_name]] <- data.frame(
+    crop = crop_name, n_total = n_total,
+    pet_min = min(df$PET_ann, na.rm = TRUE),
+    pet_mean = mean(df$PET_ann, na.rm = TRUE),
+    pet_max = max(df$PET_ann, na.rm = TRUE),
+    pet_zero_pct = round(100 * n_zero / n_total, 2),
+    pet_na_pct   = round(100 * n_na   / n_total, 2),
+    stringsAsFactors = FALSE)
+}
+cat("\n")
+
+
+# ==============================================================================
+# 2. AI DISTRIBUTION, PER CROP
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("2. AI (= PRE_ann / PET_ann) DISTRIBUTION (per crop)\n")
+cat(strrep("=", 70), "\n\n")
+
+ai_summary <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel(crop_name)
+  if (is.null(df) || !"AI" %in% names(df)) {
+    cat(sprintf("[%s] no AI column\n", crop_name)); next
+  }
+  
+  ai_vals <- df$AI
+  cat(sprintf("[%-8s] AI: min=%.3f  P10=%.3f  median=%.3f  mean=%.3f  P90=%.3f  max=%.3f  | NA=%.1f%%\n",
+              crop_name,
+              min(ai_vals, na.rm = TRUE),
+              quantile(ai_vals, 0.10, na.rm = TRUE),
+              median(ai_vals, na.rm = TRUE),
+              mean(ai_vals, na.rm = TRUE),
+              quantile(ai_vals, 0.90, na.rm = TRUE),
+              max(ai_vals, na.rm = TRUE),
+              100 * mean(is.na(ai_vals))))
+  
+  # How many rows fall in each UNEP (1997) aridity class
+  n_valid <- sum(!is.na(ai_vals))
+  cat(sprintf("           hyper-arid(<0.05)=%.1f%% | arid(<0.20)=%.1f%% | semi-arid(<0.50)=%.1f%% | dry-subhumid(<0.65)=%.1f%% | humid(>=0.65)=%.1f%%\n",
+              100 * sum(ai_vals < 0.05,                 na.rm = TRUE) / n_valid,
+              100 * sum(ai_vals < 0.20,                 na.rm = TRUE) / n_valid,
+              100 * sum(ai_vals < 0.50,                 na.rm = TRUE) / n_valid,
+              100 * sum(ai_vals < 0.65,                 na.rm = TRUE) / n_valid,
+              100 * sum(ai_vals >= 0.65,                na.rm = TRUE) / n_valid))
+  
+  ai_summary[[crop_name]] <- data.frame(
+    crop = crop_name,
+    ai_min = min(ai_vals, na.rm = TRUE), ai_median = median(ai_vals, na.rm = TRUE),
+    ai_mean = mean(ai_vals, na.rm = TRUE), ai_max = max(ai_vals, na.rm = TRUE),
+    pct_semiarid_or_drier = round(100 * sum(ai_vals < 0.50, na.rm = TRUE) / n_valid, 2),
+    stringsAsFactors = FALSE)
+}
+cat("\n")
+
+
+# ==============================================================================
+# 3. is_arid INTERNAL CONSISTENCY CHECK (per crop)
+# is_arid should be TRUE if and only if AI < 0.50 (given the panelv6/v7
+# formula). Any mismatch here points to a bug in Step 6 itself, not just
+# "real-world AI happens to be high everywhere".
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("3. is_arid CONSISTENCY CHECK (is_arid should equal AI < 0.50 exactly)\n")
+cat(strrep("=", 70), "\n\n")
+
+consistency_summary <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel(crop_name)
+  if (is.null(df) || !all(c("AI","is_arid") %in% names(df))) {
+    cat(sprintf("[%s] missing AI or is_arid column\n", crop_name)); next
+  }
+  
+  expected_arid <- as.integer(df$AI < 0.50)
+  mismatch <- !is.na(df$AI) & !is.na(df$is_arid) & (expected_arid != df$is_arid)
+  n_mismatch <- sum(mismatch, na.rm = TRUE)
+  
+  cat(sprintf("[%-8s] is_arid=1 count: %d (%.1f%%) | mismatches vs AI<0.50: %d\n",
+              crop_name,
+              sum(df$is_arid == 1, na.rm = TRUE),
+              100 * mean(df$is_arid == 1, na.rm = TRUE),
+              n_mismatch))
+  
+  consistency_summary[[crop_name]] <- data.frame(
+    crop = crop_name,
+    is_arid_pct = round(100 * mean(df$is_arid == 1, na.rm = TRUE), 2),
+    n_mismatch  = n_mismatch,
+    stringsAsFactors = FALSE)
+}
+cat("\n[NOTE] n_mismatch > 0 would mean is_arid was NOT computed consistently\n")
+cat("       from the AI values actually stored in the file -- a formula bug.\n")
+cat("       n_mismatch = 0 means is_arid is internally consistent, and any\n")
+cat("       low arid share simply reflects the AI values themselves, which\n")
+cat("       is checked next (Section 4).\n\n")
+
+
+# ==============================================================================
+# 4. COUNTRY-LEVEL MEAN AI FOR KNOWN ARID/SEMI-ARID COUNTRIES
+#
+# These countries are unambiguously arid or semi-arid on essentially any
+# definition. If their mean AI comes out >= 0.50 (i.e. classified as NOT
+# arid), that is a strong signal something is still wrong upstream --
+# most likely a unit mismatch between PRE_ann and PET_ann, or a residual
+# weighting issue from the area-weighting step.
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("4. COUNTRY-LEVEL MEAN AI -- known arid/semi-arid countries (sanity check)\n")
+cat(strrep("=", 70), "\n\n")
+
+known_arid_countries <- c(
+  SAU = "Saudi Arabia", EGY = "Egypt", ARE = "UAE", QAT = "Qatar",
+  KWT = "Kuwait", OMN = "Oman", YEM = "Yemen", LBY = "Libya",
+  DZA = "Algeria", TUN = "Tunisia", MRT = "Mauritania", NER = "Niger",
+  TCD = "Chad", SDN = "Sudan", NAM = "Namibia", BWA = "Botswana",
+  TKM = "Turkmenistan", UZB = "Uzbekistan", KAZ = "Kazakhstan (south)",
+  IRQ = "Iraq", JOR = "Jordan", ISR = "Israel"
+)
+
+# Use wheat panel as a representative check (most countries present);
+# fall back to sorghum for any missing from wheat
+df_wheat   <- read_panel("wheat")
+df_sorghum <- read_panel("sorghum")
+
+country_ai_rows <- list()
+for (iso in names(known_arid_countries)) {
+  src <- NULL
+  if (!is.null(df_wheat) && iso %in% df_wheat$Country_ISO) src <- df_wheat
+  else if (!is.null(df_sorghum) && iso %in% df_sorghum$Country_ISO) src <- df_sorghum
+  
+  if (is.null(src)) {
+    country_ai_rows[[iso]] <- data.frame(
+      Country_ISO = iso, name = known_arid_countries[iso],
+      mean_AI = NA_real_, mean_PRE_ann = NA_real_, mean_PET_ann = NA_real_,
+      is_arid_pct = NA_real_, note = "not in panel", stringsAsFactors = FALSE)
+    next
+  }
+  
+  sub <- src[src$Country_ISO == iso, ]
+  country_ai_rows[[iso]] <- data.frame(
+    Country_ISO   = iso,
+    name          = known_arid_countries[iso],
+    mean_AI       = round(mean(sub$AI, na.rm = TRUE), 3),
+    mean_PRE_ann  = round(mean(sub$PRE_ann, na.rm = TRUE), 1),
+    mean_PET_ann  = round(mean(sub$PET_ann, na.rm = TRUE), 1),
+    is_arid_pct   = round(100 * mean(sub$is_arid == 1, na.rm = TRUE), 1),
+    note          = ifelse(mean(sub$AI, na.rm = TRUE) < 0.50,
+                           "OK (classified arid/semi-arid)",
+                           "FLAG -- expected arid, AI >= 0.50"),
+    stringsAsFactors = FALSE)
+}
+
+country_ai_df <- dplyr::bind_rows(country_ai_rows)
+print(country_ai_df[, c("Country_ISO","name","mean_AI","mean_PRE_ann",
+                        "mean_PET_ann","is_arid_pct","note")], row.names = FALSE)
+
+n_flagged <- sum(grepl("^FLAG", country_ai_df$note))
+cat(sprintf("\n[SUMMARY] %d / %d known arid/semi-arid countries are NOT classified\n",
+            n_flagged, sum(!is.na(country_ai_df$mean_AI))))
+cat("          as arid (AI >= 0.50) -- if this is a large fraction, the AI\n")
+cat("          formula, PET units, or weighting likely still has an issue.\n\n")
+
+
+# ==============================================================================
+# SAVE REPORT
+# ==============================================================================
+
+writexl::write_xlsx(
+  list(
+    PET_summary_by_crop  = dplyr::bind_rows(pet_summary),
+    AI_summary_by_crop   = dplyr::bind_rows(ai_summary),
+    is_arid_consistency  = dplyr::bind_rows(consistency_summary),
+    Known_arid_countries = country_ai_df
+  ),
+  file.path(base_dir, "ai_pet_arid_check.xlsx"))
+
+cat(strrep("=", 70), "\n")
+cat("[SAVED] ai_pet_arid_check.xlsx\n")
+cat("CHECK COMPLETE -- no panelv*_ file was modified\n")
+cat(strrep("=", 70), "\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# CHECK -- full country AI ranking + humid-country sanity check
+#
+# The previous check (check_ai_pet_arid.R) only tested 22 pre-selected
+# arid/semi-arid countries. This script extends that in two ways:
+#   1. Builds a country-level mean AI ranking across ALL countries present
+#      in the panel (pooled across crops), so the full list can be
+#      eyeballed for anything geographically implausible.
+#   2. Tests a complementary set of well-known HUMID/tropical countries
+#      (rainforest climates) -- these should show HIGH AI and is_arid = 0
+#      almost always. If any of these come out arid, that is a red flag
+#      in the opposite direction from the earlier check.
+#
+# Does not modify any panelv*_ file. Read-only diagnostic.
+# ==============================================================================
+
+library(dplyr)
+library(readxl)
+library(writexl)
+
+base_dir   <- "C:/Users/Alper.Tosun/Desktop/cru130"
+crop_names <- c("wheat","barley","oats","rye","rice","maize","soybean","sorghum")
+
+read_panel <- function(crop_name) {
+  f <- file.path(base_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  if (!file.exists(f)) return(NULL)
+  as.data.frame(readxl::read_excel(f))
+}
+
+
+# ==============================================================================
+# 1. POOL AI ACROSS ALL CROPS, ONE ROW PER COUNTRY
+#
+# A country's AI should be nearly identical across crop panels (it only
+# depends on national PRE_ann/PET_ann, not on the crop-specific area
+# weights), so pooling and averaging across crops is just a way to get
+# the widest possible country coverage in one table, not a real
+# aggregation across genuinely different values.
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("1. Pooling AI across all 8 crop panels\n")
+cat(strrep("=", 70), "\n\n")
+
+all_rows <- list()
+for (crop_name in crop_names) {
+  df <- read_panel(crop_name)
+  if (is.null(df) || !all(c("Country_ISO","AI","is_arid","PRE_ann","PET_ann") %in% names(df))) next
+  all_rows[[crop_name]] <- df[, c("Country_ISO","AI","is_arid","PRE_ann","PET_ann")]
+}
+pooled <- dplyr::bind_rows(all_rows)
+
+country_ai <- pooled %>%
+  dplyr::group_by(Country_ISO) %>%
+  dplyr::summarise(
+    n_obs        = dplyr::n(),
+    mean_AI      = round(mean(AI, na.rm = TRUE), 3),
+    sd_AI        = round(sd(AI, na.rm = TRUE), 3),
+    mean_PRE_ann = round(mean(PRE_ann, na.rm = TRUE), 0),
+    mean_PET_ann = round(mean(PET_ann, na.rm = TRUE), 0),
+    pct_arid     = round(100 * mean(is_arid == 1, na.rm = TRUE), 1),
+    .groups = "drop") %>%
+  dplyr::arrange(mean_AI)
+
+cat(sprintf("[OK] %d unique countries pooled across all crop panels\n\n",
+            nrow(country_ai)))
+
+cat("--- 15 DRIEST countries (lowest mean AI) ---\n")
+print(head(country_ai, 15), n = Inf)
+
+cat("\n--- 15 WETTEST countries (highest mean AI) ---\n")
+print(tail(country_ai, 15), n = Inf)
+
+
+# ==============================================================================
+# 2. COMPLEMENTARY CHECK -- well-known HUMID / tropical rainforest countries
+# These should show HIGH AI (ideally > 1, i.e. more precipitation than
+# potential evapotranspiration) and is_arid should be 0 for nearly all
+# country-years. This is the mirror-image check of the earlier arid test.
+# ==============================================================================
+
+cat("\n", strrep("=", 70), "\n")
+cat("2. KNOWN HUMID / TROPICAL countries -- sanity check\n")
+cat(strrep("=", 70), "\n\n")
+
+known_humid_countries <- c(
+  COD = "DR Congo", COG = "Congo", GAB = "Gabon (if present)",
+  LBR = "Liberia", SLE = "Sierra Leone", GIN = "Guinea",
+  CRI = "Costa Rica", COL = "Colombia", ECU = "Ecuador",
+  MYS = "Malaysia (if present)", PHL = "Philippines (if present)",
+  VNM = "Vietnam (if present)", GTM = "Guatemala", HND = "Honduras",
+  NIC = "Nicaragua (if present)", PAN = "Panama (if present)",
+  MMR = "Myanmar", THA = "Thailand", IDN = "Indonesia (if present)",
+  UGA = "Uganda", RWA = "Rwanda", BDI = "Burundi",
+  MDG = "Madagascar (east coast)", CMR = "Cameroon (if present)"
+)
+
+humid_check <- country_ai %>%
+  dplyr::filter(Country_ISO %in% names(known_humid_countries)) %>%
+  dplyr::mutate(
+    name = known_humid_countries[Country_ISO],
+    note = ifelse(mean_AI >= 0.65, "OK (humid, as expected)",
+                  ifelse(mean_AI >= 0.50, "BORDERLINE (dry sub-humid)",
+                         "FLAG -- expected humid, AI < 0.50")))
+
+print(humid_check[, c("Country_ISO","name","mean_AI","mean_PRE_ann",
+                      "mean_PET_ann","pct_arid","note")], n = Inf)
+
+missing_humid <- setdiff(names(known_humid_countries), country_ai$Country_ISO)
+if (length(missing_humid) > 0) {
+  cat("\n[NOTE] Not present in any crop panel (no wheat/barley/.../sorghum\n")
+  cat("       production reported, so no AI value to check):\n  ")
+  cat(paste(missing_humid, collapse = ", "), "\n")
+}
+
+n_flagged_humid <- sum(grepl("^FLAG", humid_check$note))
+cat(sprintf("\n[SUMMARY] %d / %d known humid countries flagged as unexpectedly dry\n\n",
+            n_flagged_humid, nrow(humid_check)))
+
+
+# ==============================================================================
+# 3. FULL COUNTRY LIST -- for manual eyeballing
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("3. FULL COUNTRY LIST (sorted driest -> wettest)\n")
+cat(strrep("=", 70), "\n\n")
+print(country_ai, n = Inf)
+
+
+# ==============================================================================
+# SAVE REPORT
+# ==============================================================================
+
+writexl::write_xlsx(
+  list(
+    Full_country_AI_ranking = country_ai,
+    Humid_country_check     = humid_check
+  ),
+  file.path(base_dir, "ai_full_country_check.xlsx"))
+
+cat("\n[SAVED] ai_full_country_check.xlsx\n")
+cat(strrep("=", 70), "\n")
+cat("CHECK COMPLETE -- no panelv*_ file was modified\n")
+cat(strrep("=", 70), "\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# CHECK + UPDATE -- yield/area/GDP plausibility, and fixed-baseline weights
+#
+# PART A (read-only): plausibility checks for
+#   - yield_hg_per_ha   (implausible/outlier values, per crop)
+#   - area_harvested_ha (implausible values, and cross-check against
+#                        cropland_area_1000ha from Step 5 -- a single crop's
+#                        harvested area should not routinely exceed a
+#                        country's total cropland area)
+#   - GDP_per_Capita    (negative/zero, extreme year-over-year jumps, and
+#                        any leftover flat/backfilled runs not caught by
+#                        Step 7's remove_gdp_backfill())
+#
+# PART B (MODIFIES panelv7_*.xlsx): adds the fixed-baseline weight columns
+# needed for the fixed-baseline weighting specification (weights = 1990-2000
+# fixed average production).
+#   baseline_production_tonnes   -- fixed weight, same value for every year
+#                                   of a given country (does not vary by Yil)
+#   baseline_area_harvested_ha   -- same idea, for area-based robustness
+#   baseline_period_used         -- text label: "1990-2000" or the actual
+#                                   fallback window used (e.g. "1961-1971")
+#   baseline_is_fallback         -- 1 if the country had zero years within
+#                                   1990-2000 and a fallback window was used
+#
+# Fallback rule when a country has no data in 1990-2000:
+#   Use the country's own earliest available years (first 11, or all
+#   available if fewer than 11) as its baseline window instead. This keeps
+#   the weight fixed and independent of any later-year climate shocks for
+#   that country, just anchored to its actual data start instead of a
+#   universal calendar window.
+# ==============================================================================
+
+library(dplyr)
+library(readxl)
+library(writexl)
+
+base_dir   <- "C:/Users/Alper.Tosun/Desktop/cru130"
+crop_names <- c("wheat","barley","oats","rye","rice","maize","soybean","sorghum")
+
+read_panel <- function(crop_name) {
+  f <- file.path(base_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  if (!file.exists(f)) return(NULL)
+  as.data.frame(readxl::read_excel(f))
+}
+
+
+# ==============================================================================
+# PART A1 -- YIELD PLAUSIBILITY
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("PART A1 -- yield_hg_per_ha plausibility (per crop)\n")
+cat(strrep("=", 70), "\n\n")
+
+yield_flags <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel(crop_name)
+  if (is.null(df) || !"yield_hg_per_ha" %in% names(df)) next
+  
+  y <- df$yield_hg_per_ha
+  cat(sprintf("[%-8s] min=%.0f  P1=%.0f  median=%.0f  mean=%.0f  P99=%.0f  max=%.0f  (hg/ha)\n",
+              crop_name, min(y, na.rm = TRUE), quantile(y, 0.01, na.rm = TRUE),
+              median(y, na.rm = TRUE), mean(y, na.rm = TRUE),
+              quantile(y, 0.99, na.rm = TRUE), max(y, na.rm = TRUE)))
+  
+  # Negative/zero shouldn't exist (YIELD_THRESHOLD>=1 already applied), but
+  # verify. Also flag extreme statistical outliers within each crop
+  # (beyond mean +/- 5 SD) for manual review -- not auto-removed.
+  neg_or_zero <- df[!is.na(y) & y <= 0, c("Country_ISO","Yil","yield_hg_per_ha")]
+  mu <- mean(y, na.rm = TRUE); sdv <- sd(y, na.rm = TRUE)
+  extreme <- df[!is.na(y) & abs(y - mu) > 5 * sdv,
+                c("Country_ISO","Yil","yield_hg_per_ha")]
+  
+  if (nrow(neg_or_zero) > 0) {
+    cat(sprintf("  [FLAG] %d rows with yield <= 0\n", nrow(neg_or_zero)))
+  }
+  if (nrow(extreme) > 0) {
+    cat(sprintf("  [FLAG] %d rows beyond mean +/- 5 SD (statistical outliers, for review):\n",
+                nrow(extreme)))
+    print(head(extreme[order(-extreme$yield_hg_per_ha), ], 10))
+    yield_flags[[crop_name]] <- cbind(crop = crop_name, extreme)
+  }
+  if (nrow(neg_or_zero) == 0 && nrow(extreme) == 0)
+    cat("  [OK] no implausible or extreme-outlier yields\n")
+  cat("\n")
+}
+yield_flags_df <- dplyr::bind_rows(yield_flags)
+
+
+# ==============================================================================
+# PART A2 -- AREA_HARVESTED_HA PLAUSIBILITY (incl. cross-check vs cropland)
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("PART A2 -- area_harvested_ha plausibility (per crop)\n")
+cat(strrep("=", 70), "\n\n")
+
+area_flags <- list()
+
+for (crop_name in crop_names) {
+  df <- read_panel(crop_name)
+  if (is.null(df) || !"area_harvested_ha" %in% names(df)) next
+  
+  a <- df$area_harvested_ha
+  cat(sprintf("[%-8s] min=%.0f  median=%.0f  mean=%.0f  max=%.0f  (ha)\n",
+              crop_name, min(a, na.rm = TRUE), median(a, na.rm = TRUE),
+              mean(a, na.rm = TRUE), max(a, na.rm = TRUE)))
+  
+  neg_or_zero <- df[!is.na(a) & a <= 0, c("Country_ISO","Yil","area_harvested_ha")]
+  if (nrow(neg_or_zero) > 0)
+    cat(sprintf("  [FLAG] %d rows with area_harvested_ha <= 0\n", nrow(neg_or_zero)))
+  
+  # Cross-check: single-crop harvested area should not routinely exceed
+  # the country's total cropland area (cropland_area_1000ha, from Step 5).
+  # Some excess is possible (multi-cropping/double-cropping counted
+  # separately in FAO data), so this is flagged for review, not treated
+  # as a hard error.
+  if ("cropland_area_1000ha" %in% names(df)) {
+    df$cropland_ha <- df$cropland_area_1000ha * 1000
+    exceed <- df[!is.na(df$area_harvested_ha) & !is.na(df$cropland_ha) &
+                   df$area_harvested_ha > df$cropland_ha,
+                 c("Country_ISO","Yil","area_harvested_ha","cropland_ha")]
+    if (nrow(exceed) > 0) {
+      exceed$ratio <- round(exceed$area_harvested_ha / exceed$cropland_ha, 2)
+      cat(sprintf("  [FLAG] %d rows where this crop's area exceeds total cropland area:\n",
+                  nrow(exceed)))
+      print(head(exceed[order(-exceed$ratio), ], 10))
+      area_flags[[crop_name]] <- cbind(crop = crop_name, exceed)
+    } else {
+      cat("  [OK] crop area never exceeds total cropland area\n")
+    }
+  }
+  cat("\n")
+}
+area_flags_df <- dplyr::bind_rows(area_flags)
+
+
+# ==============================================================================
+# PART A3 -- GDP_per_Capita PLAUSIBILITY
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("PART A3 -- GDP_per_Capita plausibility (per crop panel; GDP is the\n")
+cat("           same series across crops for a given country-year, so any\n")
+cat("           one crop panel is representative -- using wheat)\n")
+cat(strrep("=", 70), "\n\n")
+
+df_gdp_check <- read_panel("wheat")
+
+if (!is.null(df_gdp_check) && "GDP_per_Capita" %in% names(df_gdp_check)) {
+  g <- df_gdp_check$GDP_per_Capita
+  cat(sprintf("GDP_per_Capita: min=%.0f  median=%.0f  mean=%.0f  max=%.0f  (USD)\n",
+              min(g, na.rm = TRUE), median(g, na.rm = TRUE),
+              mean(g, na.rm = TRUE), max(g, na.rm = TRUE)))
+  
+  neg_or_zero_gdp <- df_gdp_check[!is.na(g) & g <= 0,
+                                  c("Country_ISO","Yil","GDP_per_Capita")]
+  if (nrow(neg_or_zero_gdp) > 0) {
+    cat(sprintf("[FLAG] %d rows with GDP_per_Capita <= 0\n", nrow(neg_or_zero_gdp)))
+  } else {
+    cat("[OK] no non-positive GDP_per_Capita values\n")
+  }
+  
+  # Extreme year-over-year jumps: ratio > 5x or < 0.2x vs previous year,
+  # within the same country -- possible data error or genuine crisis/
+  # currency event, worth a look either way.
+  gdp_jumps <- df_gdp_check %>%
+    dplyr::arrange(Country_ISO, Yil) %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::mutate(gdp_ratio = GDP_per_Capita / dplyr::lag(GDP_per_Capita)) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(!is.na(gdp_ratio) & (gdp_ratio > 5 | gdp_ratio < 0.2))
+  
+  cat(sprintf("\n[FLAG] %d country-years with >5x or <0.2x GDP jump vs prior year:\n",
+              nrow(gdp_jumps)))
+  if (nrow(gdp_jumps) > 0)
+    print(gdp_jumps[order(-gdp_jumps$gdp_ratio),
+                    c("Country_ISO","Yil","GDP_per_Capita","gdp_ratio")], n = 20)
+  
+  # Leftover flat/constant runs (3+ consecutive identical values) anywhere
+  # in the series -- Step 7 only removes a flat run at the START of a
+  # series (WDI backfill artifact); a flat run in the MIDDLE would not be
+  # caught by that function and is worth flagging separately.
+  flat_runs <- df_gdp_check %>%
+    dplyr::arrange(Country_ISO, Yil) %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::mutate(
+      same_as_prev = GDP_per_Capita == dplyr::lag(GDP_per_Capita),
+      run_id = cumsum(is.na(same_as_prev) | !same_as_prev)) %>%
+    dplyr::group_by(Country_ISO, run_id) %>%
+    dplyr::summarise(run_length = dplyr::n(),
+                     start_year = min(Yil), end_year = max(Yil),
+                     value = dplyr::first(GDP_per_Capita), .groups = "drop") %>%
+    dplyr::filter(run_length >= 4)
+  
+  cat(sprintf("\n[FLAG] %d flat GDP runs of >= 4 consecutive identical years\n",
+              nrow(flat_runs)))
+  if (nrow(flat_runs) > 0)
+    print(flat_runs[order(-flat_runs$run_length), ], n = 20)
+  
+} else {
+  gdp_jumps <- data.frame(); flat_runs <- data.frame()
+  cat("[SKIP] wheat panel or GDP_per_Capita column not found\n")
+}
+cat("\n")
+
+
+# ==============================================================================
+# PART B -- COMPUTE AND ADD FIXED-BASELINE WEIGHT COLUMNS
+#
+# THIS PART MODIFIES panelv7_*.xlsx (adds columns, overwrites the files).
+# Everything above (Part A) is read-only.
+# ==============================================================================
+
+cat(strrep("=", 70), "\n")
+cat("PART B -- Adding fixed-baseline weight columns to panelv7_*.xlsx\n")
+cat(strrep("=", 70), "\n\n")
+
+BASELINE_START <- 1990
+BASELINE_END   <- 2000
+BASELINE_LEN   <- BASELINE_END - BASELINE_START + 1   # 11
+
+compute_baseline <- function(df) {
+  df %>%
+    dplyr::group_by(Country_ISO) %>%
+    dplyr::group_modify(function(sub, key) {
+      in_window <- sub[sub$Yil >= BASELINE_START & sub$Yil <= BASELINE_END, ]
+      
+      if (nrow(in_window) >= 1) {
+        used_years <- sort(in_window$Yil)
+        base_prod  <- mean(in_window$production_tonnes, na.rm = TRUE)
+        base_area  <- mean(in_window$area_harvested_ha, na.rm = TRUE)
+        is_fallback <- 0L
+      } else {
+        # Fallback: earliest available years for this country (up to 11)
+        sub_sorted <- sub[order(sub$Yil), ]
+        take_n     <- min(BASELINE_LEN, nrow(sub_sorted))
+        fallback_rows <- sub_sorted[seq_len(take_n), ]
+        used_years    <- sort(fallback_rows$Yil)
+        base_prod     <- mean(fallback_rows$production_tonnes, na.rm = TRUE)
+        base_area     <- mean(fallback_rows$area_harvested_ha, na.rm = TRUE)
+        is_fallback   <- 1L
+      }
+      
+      period_label <- if (length(used_years) == 0) NA_character_ else
+        paste0(min(used_years), "-", max(used_years))
+      
+      data.frame(
+        baseline_production_tonnes = base_prod,
+        baseline_area_harvested_ha = base_area,
+        baseline_period_used       = period_label,
+        baseline_is_fallback       = is_fallback,
+        stringsAsFactors = FALSE)
+    }) %>%
+    dplyr::ungroup()
+}
+
+fallback_summary <- list()
+
+for (crop_name in crop_names) {
+  panelv7_path <- file.path(base_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  df <- read_panel(crop_name)
+  if (is.null(df)) { cat(sprintf("[%s] panelv7 missing, skipped\n", crop_name)); next }
+  
+  baseline_vals <- compute_baseline(df)
+  
+  df <- df %>%
+    dplyr::select(-dplyr::any_of(c("baseline_production_tonnes",
+                                   "baseline_area_harvested_ha",
+                                   "baseline_period_used",
+                                   "baseline_is_fallback"))) %>%
+    dplyr::left_join(baseline_vals, by = "Country_ISO")
+  
+  n_fallback <- length(unique(df$Country_ISO[df$baseline_is_fallback == 1]))
+  n_total    <- length(unique(df$Country_ISO))
+  cat(sprintf("[%-8s] baseline computed | fallback used for %d / %d countries\n",
+              crop_name, n_fallback, n_total))
+  
+  if (n_fallback > 0) {
+    fb_detail <- df %>%
+      dplyr::filter(baseline_is_fallback == 1) %>%
+      dplyr::distinct(Country_ISO, baseline_period_used) %>%
+      dplyr::mutate(crop = crop_name)
+    fallback_summary[[crop_name]] <- fb_detail
+    print(fb_detail[, c("Country_ISO","baseline_period_used")], row.names = FALSE)
+  }
+  
+  writexl::write_xlsx(df, panelv7_path)
+  cat(sprintf("  [SAVED] %s (with baseline columns added)\n\n", basename(panelv7_path)))
+}
+
+fallback_df <- dplyr::bind_rows(fallback_summary)
+
+cat("\n[NOTE] Countries using the fallback window (no 1990-2000 data at all)\n")
+cat("       had their baseline computed from their own earliest available\n")
+cat("       years instead. This is documented per-country in the\n")
+cat("       baseline_period_used column saved in each panelv7 file.\n\n")
+
+
+# ==============================================================================
+# SAVE DIAGNOSTIC REPORT (Part A results + Part B fallback summary)
+# ==============================================================================
+
+report_sheets <- list()
+if (nrow(yield_flags_df) > 0) report_sheets[["Yield_outliers"]]  <- yield_flags_df
+if (nrow(area_flags_df)  > 0) report_sheets[["Area_exceeds_cropland"]] <- area_flags_df
+if (exists("gdp_jumps") && nrow(gdp_jumps) > 0) report_sheets[["GDP_jumps"]] <- gdp_jumps
+if (exists("flat_runs") && nrow(flat_runs) > 0) report_sheets[["GDP_flat_runs"]] <- flat_runs
+if (nrow(fallback_df) > 0) report_sheets[["M19_baseline_fallback"]] <- fallback_df
+
+if (length(report_sheets) > 0) {
+  writexl::write_xlsx(report_sheets,
+                      file.path(base_dir, "yield_area_gdp_m19_check.xlsx"))
+  cat("[SAVED] yield_area_gdp_m19_check.xlsx\n")
+  cat("  Sheets:", paste(names(report_sheets), collapse = ", "), "\n")
+} else {
+  cat("[OK] No issues flagged in Part A -- no report file needed\n")
+}
+
+cat("\n", strrep("=", 70), "\n")
+cat("COMPLETE -- Part A was read-only. Part B ADDED baseline_* columns\n")
+cat("to all panelv7_*.xlsx files (existing columns unchanged).\n")
+cat(strrep("=", 70), "\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
