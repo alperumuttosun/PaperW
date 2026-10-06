@@ -10,7 +10,7 @@
 # Step 6  Community-assignment stability across R (ARI/NMI, R=1 and R=3 vs R=5)
 # Step 7  Null model 2 (degree-preserving topology randomization)
 # Step 8  Diagnostics: pair-count audit, prevalence by R, XGB/LASSO dispersion, yield skew
-# Step 9  Figures 1 and 2
+# Step 9  Figures 1 and 2 (publication versions: PDF, EPS, 1600-dpi TIFF, 300-dpi PNG; base R graphics only)
 # Step 10 OPTIONAL data check: where the GDP values come from (constant-US$ series, PPP fallback, interpolation)  [needs internet + WDI package; off by default]
 # -----------------------------------------------------------------------------
 # HOW TO USE: run the whole file. Heavy steps 1 and 5 are skipped automatically if
@@ -22,7 +22,6 @@
 suppressPackageStartupMessages({
   library(readxl)    # read the Excel panels
   library(dplyr)     # data wrangling
-  library(tidyr)     # pivot_longer for Step 9
   library(igraph)    # graphs, Louvain community detection
   library(writexl)   # write Excel outputs
 })
@@ -438,44 +437,107 @@ step8 <- function() {
 }
 
 # =============================================================================
-# STEP 9 -- Figures 1 and 2 (axis labels only; titles/captions live in the manuscript)
+# STEP 9 -- Figures 1 and 2, publication versions (base R graphics only)
+# Per figure: vector PDF, EPS, 1600-dpi TIFF (LZW) and a 300-dpi PNG (for Word). Width 174 mm.
+# Arial lettering (Helvetica in the PDF/EPS fallbacks), no titles inside the figures,
+# solid versus 45-degree-striped shapes (readable in grey scale).
 # =============================================================================
 step9 <- function() {
-  library(ggplot2); library(ggpattern)                                     # install.packages("ggpattern") if missing
   s2 <- read_excel(out_file("networkstep2_output.xlsx"))
-  # Figure 1: observed modularity (solid) vs null-model-1 mean (hollow), LASSO
-  f1 <- s2 %>% filter(metric == "NT_lasso") %>% mutate(crop = factor(crop, levels = names(crop_colors)))
-  yr <- max(f1$modularity_real)
-  fig1 <- ggplot(f1, aes(x = crop)) +
-    geom_segment(aes(xend = crop, y = modularity_null_mean, yend = modularity_real, color = crop), alpha = 0.5, linewidth = 0.6) +
-    geom_point(aes(y = modularity_null_mean, color = crop), shape = 21, fill = "white", stroke = 1.4, size = 4) +
-    geom_point(aes(y = modularity_real, color = crop, fill = crop), shape = 21, stroke = 1.4, size = 4) +
-    scale_color_manual(values = crop_colors, guide = "none") + scale_fill_manual(values = crop_colors, guide = "none") +
-    annotate("point", x = 6.3, y = yr + 0.045, shape = 21, fill = "grey50", color = "grey50", stroke = 1.4, size = 4) +
-    annotate("text",  x = 6.5, y = yr + 0.045, label = "Observed", hjust = 0, size = 3.6) +
-    annotate("point", x = 6.3, y = yr + 0.005, shape = 21, fill = "white", color = "grey50", stroke = 1.4, size = 4) +
-    annotate("text",  x = 6.5, y = yr + 0.005, label = "Null (weight-shuffled)", hjust = 0, size = 3.6) +
-    coord_cartesian(ylim = c(NA, yr + 0.06)) + labs(x = "Crop", y = "Modularity") +
-    theme_minimal(base_size = 12) + theme(panel.grid.minor = element_blank())
-  for (ext in c("pdf", "png", "tiff"))
-    ggsave(file.path(fig_dir, paste0("fig1_modularity_vs_null.", ext)), fig1, width = 7, height = 4.8, dpi = 300)
-  # Figure 2: ARI / NMI vs climate-GDP clusters; LASSO solid, XGBoost striped (same colour)
-  f2 <- s2 %>% select(crop, metric, ARI_vs_climate, NMI_vs_climate) %>%
-    pivot_longer(c(ARI_vs_climate, NMI_vs_climate), names_to = "stat", values_to = "value") %>%
-    mutate(crop = factor(crop, levels = names(crop_colors)),
-           stat = recode(stat, ARI_vs_climate = "ARI", NMI_vs_climate = "NMI"),
-           model = recode(metric, NT_lasso = "LASSO", NT_xgb = "XGBoost"))
-  fig2 <- ggplot(f2, aes(x = crop, y = value, fill = crop, pattern = model)) +
-    geom_col_pattern(position = position_dodge(width = 0.8), width = 0.7, color = "black", pattern_fill = "white",
-                     pattern_density = 0.35, pattern_spacing = 0.02, pattern_angle = 45, pattern_color = NA) +
-    scale_fill_manual(values = crop_colors, guide = "none") +
-    scale_pattern_manual(values = c(LASSO = "none", XGBoost = "stripe"), name = "Model") +
-    facet_wrap(~stat) + labs(x = "Crop", y = "Agreement with climate/GDP clusters") +
-    theme_minimal(base_size = 12) +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top",
-          legend.spacing.x = unit(1.2, "cm"), legend.box.spacing = unit(0.5, "cm"), legend.title = element_blank())
-  for (ext in c("pdf", "png", "tiff"))
-    ggsave(file.path(fig_dir, paste0("fig2_ari_nmi_climate.", ext)), fig2, width = 8, height = 5, dpi = 300)
+  lasso <- s2 %>% filter(metric == "NT_lasso") %>% arrange(match(crop, names(crop_colors)))   # one row per crop, fixed order
+  xgb   <- s2 %>% filter(metric == "NT_xgb")   %>% arrange(match(crop, names(crop_colors)))
+  cols  <- unname(crop_colors[lasso$crop])                                  # crop colours in the same order
+  crop_names <- lasso$crop
+  n_crop <- length(crop_names)
+
+  tint <- function(col, k = 0.55) {                                         # lighter solid colour for the connector lines
+    v <- col2rgb(col)[, 1] / 255
+    rgb(k * v[1] + (1 - k), k * v[2] + (1 - k), k * v[3] + (1 - k))
+  }
+  circle_xy <- function(cx, cy, r_in, n = 60) {                             # circle with a radius in inches, drawn in data units
+    usr <- par("usr"); pin <- par("pin")
+    th <- seq(0, 2 * pi, length.out = n)
+    list(x = cx + r_in * (usr[2] - usr[1]) / pin[1] * cos(th),
+         y = cy + r_in * (usr[4] - usr[3]) / pin[2] * sin(th))
+  }
+  solid_circle <- function(cx, cy, r_in, col) {                             # filled circle with a thin black outline
+    xy <- circle_xy(cx, cy, r_in)
+    polygon(xy$x, xy$y, col = col, border = "black", lwd = 0.6)
+  }
+  hatched_circle <- function(cx, cy, r_in, col) {                           # 45-degree stripes in the crop colour + black outline
+    xy <- circle_xy(cx, cy, r_in)
+    polygon(xy$x, xy$y, density = 45, angle = 45, col = col, border = NA, lwd = 0.9)
+    polygon(xy$x, xy$y, col = NA, border = "black", lwd = 0.6)
+  }
+
+  # ---- Figure 1: observed modularity (solid) versus the mean of null model 1 (striped), LASSO ----
+  draw_fig1 <- function() {
+    par(mar = c(3.6, 4.4, 0.8, 0.8), mgp = c(2.4, 0.6, 0), las = 1)
+    ylim <- c(0.18, max(lasso$modularity_real) + 0.075)                     # head-room for the legend
+    plot(NA, xlim = c(0.5, n_crop + 0.5), ylim = ylim, axes = FALSE, xlab = "", ylab = "", xaxs = "i", yaxs = "i")
+    axis(1, at = seq_len(n_crop), labels = crop_names, lwd = 0.8, tcl = -0.3)   # crop names on the x axis
+    axis(2, lwd = 0.8, tcl = -0.3)
+    box(bty = "l", lwd = 0.8)
+    mtext("Crop", side = 1, line = 2.4); mtext("Modularity", side = 2, line = 3.1, las = 0)
+    r_in <- 0.07                                                            # marker radius (inches)
+    for (i in seq_len(n_crop)) {
+      yn <- lasso$modularity_null_mean[i]; yr <- lasso$modularity_real[i]
+      segments(i, yn, i, yr, col = tint(cols[i]), lwd = 1.4)                # connector between the two values
+      hatched_circle(i, yn, r_in, cols[i])                                  # null model 1: striped
+      solid_circle(i, yr, r_in, cols[i])                                    # observed: solid
+    }
+    y1 <- ylim[2] - 0.020; y2 <- ylim[2] - 0.057; x0 <- n_crop - 2.7       # hand-drawn legend, above the data
+    solid_circle(x0, y1, r_in, "grey55");   text(x0 + 0.25, y1, "Observed", adj = c(0, 0.5))
+    hatched_circle(x0, y2, r_in, "black");  text(x0 + 0.25, y2, "Null model 1 (mean)", adj = c(0, 0.5))
+  }
+
+  # ---- Figure 2: (a) ARI and (b) NMI versus climate/GDP clusters; LASSO solid, XGBoost striped ----
+  draw_fig2 <- function() {
+    par(mfrow = c(1, 2), oma = c(0, 0, 2.2, 0), mar = c(5.2, 4.4, 1.6, 0.8), mgp = c(2.4, 0.6, 0), las = 1)
+    for (k in 1:2) {
+      stat <- c("ARI_vs_climate", "NMI_vs_climate")[k]; lab <- c("ARI", "NMI")[k]
+      vl <- lasso[[stat]]; vx <- xgb[[stat]]
+      ylim <- c(0, max(vl, vx) * 1.12)
+      plot(NA, xlim = c(0.4, n_crop + 0.6), ylim = ylim, axes = FALSE, xlab = "", ylab = "", xaxs = "i", yaxs = "i")
+      axis(2, lwd = 0.8, tcl = -0.3); axis(1, at = seq_len(n_crop), labels = FALSE, lwd = 0.8, tcl = -0.3)
+      box(bty = "l", lwd = 0.8)
+      for (i in seq_len(n_crop)) {
+        rect(i - 0.38, 0, i, vl[i], col = cols[i], border = "black", lwd = 0.6)                          # LASSO: solid
+        rect(i, 0, i + 0.38, vx[i], density = 45, angle = 45, col = cols[i], border = NA, lwd = 0.9)     # XGBoost: stripes
+        rect(i, 0, i + 0.38, vx[i], col = NA, border = "black", lwd = 0.6)                              # black outline
+      }
+      text(seq_len(n_crop), -0.035 * diff(ylim), labels = crop_names, srt = 45, adj = c(1, 1), xpd = NA)  # rotated crop names
+      mtext("Crop", side = 1, line = 4.0); mtext(lab, side = 2, line = 3.0, las = 0)
+      mtext(c("a", "b")[k], side = 3, line = 0.3, adj = -0.22, font = 2, cex = 1.2)                       # panel letter
+    }
+    par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE); plot.new()        # shared legend on top
+    legend("top", legend = c("LASSO", "XGBoost"), fill = c("grey55", "black"), density = c(NA, 45), angle = 45,
+           border = "black", horiz = TRUE, bty = "n", x.intersp = 0.8, inset = c(0, 0.01))
+  }
+
+  # ---- writer: PDF + EPS (vector), TIFF 1600 dpi, PNG 300 dpi ----
+  write_one <- function(open_dev, draw) {                                   # open a device, draw, close it (even if drawing fails)
+    open_dev()
+    ok <- tryCatch({ draw(); TRUE }, error = function(e) { message("  drawing failed: ", conditionMessage(e)); FALSE })
+    dev.off()
+    ok
+  }
+  save_figure <- function(draw, name, h_mm) {
+    w <- 174 / 25.4; h <- h_mm / 25.4                                      # inches
+    f <- function(ext) file.path(fig_dir, paste0(name, ext))
+    okpdf <- tryCatch(write_one(function() cairo_pdf(f(".pdf"), width = w, height = h, pointsize = 9, family = "Arial"), draw),
+                      error = function(e) FALSE)                            # embedded-font PDF; fallback below
+    if (!isTRUE(okpdf)) write_one(function() pdf(f(".pdf"), width = w, height = h, pointsize = 9, family = "Helvetica"), draw)
+    write_one(function() postscript(f(".eps"), width = w, height = h, horizontal = FALSE, onefile = FALSE,
+                                    paper = "special", pointsize = 9, family = "Helvetica"), draw)
+    write_one(function() tiff(f("_1600dpi.tif"), width = w, height = h, units = "in", res = 1600,
+                              compression = "lzw", pointsize = 9, family = "Arial"), draw)
+    write_one(function() png(f("_300dpi.png"), width = w, height = h, units = "in", res = 300,
+                             pointsize = 9, family = "Arial"), draw)
+    cat("Saved", name, "(PDF, EPS, 1600-dpi TIFF, 300-dpi PNG)\n")
+  }
+  save_figure(draw_fig1, "Fig1", 88)
+  save_figure(draw_fig2, "Fig2", 82)
   cat("Figures saved to:", fig_dir, "\n")
 }
 
@@ -573,6 +635,21 @@ for (s in RUN_ORDER) if (RUN[paste0("step", s)]) {
   get(paste0("step", s))()                                                 # call step1() ... step9()
 }
 cat("\nPIPELINE FINISHED in", round(as.numeric(difftime(Sys.time(), t_all, units = "mins")), 1), "minutes\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
