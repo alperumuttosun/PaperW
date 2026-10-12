@@ -647,7 +647,150 @@ cat("\nPIPELINE FINISHED in", round(as.numeric(difftime(Sys.time(), t_all, units
 
 
 
+# =============================================================================
+# network_sim_step11.R
+# Step 11 -- Simulation study: size, power and community recovery of the two
+# null-model tests applied to a noisy, node-heterogeneous, estimated network.
+# Run:  Rscript network_sim_step11.R quick   (timing pilot, ~minutes)
+#       Rscript network_sim_step11.R         (full study)
+# Output: sim_step11_results.csv, sim_step11_summary.csv, Figure_A1 (pdf/eps/tif/png)
+# =============================================================================
+suppressPackageStartupMessages({ library(igraph); library(parallel) })  # graphs + Louvain; parallel loop
 
+args  <- commandArgs(trailingOnly = TRUE)                 # "quick" switches to a small pilot
+quick <- length(args) > 0 && args[1] == "quick"
+
+# ---- design parameters ------------------------------------------------------
+N_set    <- c(60, 100)                  # number of countries (nodes)
+K        <- 3                           # planted communities
+R_rep    <- 5                           # NT repeats: edge noise sd = sigma_e / sqrt(R)
+sigma_e  <- 1                           # pair-level noise sd (arbitrary scale)
+tau      <- 0.3                         # target-level shared noise sd (edges sharing a target are dependent)
+node_set <- c(0, 0.5)                   # sd of node source/target effects (0 = homogeneous, 0.5 = hub-like)
+delta_set<- c(0, 0.15, 0.30, 0.45)      # extra NT for same-community pairs (signal strength)
+mu0      <- 0.15                        # baseline shift so that about 56% of pair NT values are positive
+n_reps   <- if (quick) 6   else 200     # Monte Carlo replications per design cell
+B        <- if (quick) 49  else 199     # null draws per test
+alpha    <- 0.05
+n_cores  <- max(1, detectCores() - 0)   # use all cores
+
+# ---- one simulated network ---------------------------------------------------
+sim_network <- function(N, node_sd, delta) {
+  z   <- sample(rep(1:K, length.out = N))                          # true community of each node
+  a   <- rnorm(N, 0, node_sd); b <- rnorm(N, 0, node_sd)          # source and target effects
+  u   <- rnorm(N, 0, tau)                                         # shared target-level noise
+  same <- outer(z, z, "==") * 1                                   # 1 if same community
+  eps <- matrix(rnorm(N * N, 0, sigma_e / sqrt(R_rep)), N, N)     # estimation noise shrinks with R
+  NT  <- mu0 + outer(a, b, "+") + delta * same + eps + matrix(u, N, N, byrow = TRUE)  # NT(s | t) in row s, column t
+  diag(NT) <- NA
+  W <- pmax(NT, 0) + pmax(t(NT), 0)                               # undirected positive-edge weight, as in the paper
+  W[is.na(W)] <- 0
+  gr <- graph_from_adjacency_matrix(W, mode = "undirected", weighted = TRUE, diag = FALSE)
+  list(g = simplify(gr), z = z)
+}
+
+random_degseq_graph <- function(deg) {                            # works across igraph versions
+  tryCatch(sample_degseq(deg, method = "simple"),                 # igraph >= 2.0 name
+           error = function(e) sample_degseq(deg, method = "configuration"))  # older igraph name
+}
+
+mod_louvain <- function(g) {                                      # Louvain modularity and membership
+  cl <- cluster_louvain(g, weights = E(g)$weight)
+  list(mod = modularity(g, membership(cl), weights = E(g)$weight), mem = membership(cl))
+}
+
+ari <- function(a, b) {                                           # Adjusted Rand Index
+  tab <- table(a, b); n <- sum(tab)
+  sr <- sum(choose(rowSums(tab), 2)); sc <- sum(choose(colSums(tab), 2))
+  ex <- sr * sc / choose(n, 2)
+  (sum(choose(tab, 2)) - ex) / (0.5 * (sr + sc) - ex)
+}
+
+# ---- one replication: both null tests ---------------------------------------
+one_rep <- function(N, node_sd, delta) {
+  s  <- sim_network(N, node_sd, delta); g <- s$g
+  ob <- mod_louvain(g); w <- E(g)$weight; deg <- degree(g)
+  m1 <- replicate(B, {                                            # null 1: same topology, shuffled weights
+    g1 <- g; E(g1)$weight <- sample(w); mod_louvain(g1)$mod })
+  m2 <- replicate(B, {                                            # null 2: random graph with same degrees, resampled weights
+    g2 <- simplify(random_degseq_graph(deg))
+    if (ecount(g2) == 0) return(NA_real_)
+    E(g2)$weight <- sample(w, ecount(g2), replace = TRUE); mod_louvain(g2)$mod })
+  p1 <- (sum(m1 >= ob$mod, na.rm = TRUE) + 1) / (sum(!is.na(m1)) + 1)   # Monte Carlo p = (b+1)/(B+1)
+  p2 <- (sum(m2 >= ob$mod, na.rm = TRUE) + 1) / (sum(!is.na(m2)) + 1)
+  c(mod = ob$mod, p1 = p1, p2 = p2, ari = ari(s$z, ob$mem), ncomm = length(unique(ob$mem)))
+}
+
+# ---- parallel helper: fork on Linux/macOS, socket cluster on Windows ----------
+use_psock <- .Platform$OS.type == "windows" || Sys.getenv("SIM_PSOCK") == "1"   # mclapply cannot fork on Windows
+cl <- NULL
+run_par <- function(x, f) {
+  if (use_psock) {
+    if (n_cores <= 1) return(lapply(x, f))                        # single core: plain loop
+    if (is.null(cl)) { cl <<- makeCluster(n_cores); clusterSetRNGStream(cl, 2026) }   # start workers once
+    clusterExport(cl, c("one_rep", "sim_network", "mod_louvain", "random_degseq_graph", "ari",
+                        "K", "R_rep", "sigma_e", "tau", "mu0", "B", "gi", "N_set", "node_set", "delta_set"),
+                  envir = globalenv())                            # send functions and settings to workers
+    clusterEvalQ(cl, suppressPackageStartupMessages(library(igraph)))   # igraph on every worker
+    return(parLapply(cl, x, f))
+  }
+  mclapply(x, f, mc.cores = n_cores, mc.set.seed = TRUE)          # Linux/macOS
+}
+
+plot_only <- length(args) > 0 && args[1] == "plot"      # "plot": redraw the figure from saved summary only
+t0 <- Sys.time()
+if (plot_only) {
+  agg <- read.csv("sim_step11_summary.csv")                      # reuse saved results
+} else {
+# ---- run the grid -----------------------------------------------------------
+grid <- expand.grid(N = N_set, node_sd = node_set, delta = delta_set)
+set.seed(2026); RNGkind("L'Ecuyer-CMRG")                          # reproducible parallel streams
+res <- list(); for (i in seq_len(nrow(grid))) {
+  gi <- grid[i, ]
+  out <- run_par(seq_len(n_reps), function(r) one_rep(gi$N, gi$node_sd, gi$delta))   # parallel over replications
+  bad <- vapply(out, function(o) inherits(o, "try-error") || !is.numeric(o), logical(1))
+  if (any(bad)) stop("replication error: ", as.character(out[[which(bad)[1]]]))   # never aggregate silent errors
+  m <- do.call(rbind, out)
+  res[[i]] <- data.frame(gi, rep = seq_len(n_reps), m, row.names = NULL)
+  cat(sprintf("cell %d/%d (N=%d, node_sd=%.1f, delta=%.2f) done | %.1f min\n", i, nrow(grid),
+              gi$N, gi$node_sd, gi$delta, as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+}
+res <- do.call(rbind, res)
+tag <- if (quick) "_quick" else ""
+write.csv(res, sprintf("sim_step11_results%s.csv", tag), row.names = FALSE)
+
+# ---- summary: rejection rates (size at delta = 0, power otherwise) and ARI ---
+res$rej_null1 <- as.numeric(res$p1 <= alpha); res$rej_null2 <- as.numeric(res$p2 <= alpha)  # reject indicators
+agg <- aggregate(cbind(rej_null1, rej_null2, ari, mod) ~ N + node_sd + delta, data = res, FUN = mean)  # means per cell
+write.csv(agg, sprintf("sim_step11_summary%s.csv", tag), row.names = FALSE)
+print(agg)
+
+}
+
+# ---- figure (base R): rejection rate vs delta, one panel per node heterogeneity
+save_fig <- function(base) {
+  draw <- function() {
+    par(mfrow = c(1, 2), mar = c(4.2, 4.2, 2.2, 0.8), family = "sans")
+    for (ns in node_set) {
+      plot(NA, xlim = range(delta_set), ylim = c(0, 1), xlab = expression(delta ~ "(same-community signal)"),
+           ylab = "Rejection rate at 5% level", main = "")                                                    # no title inside the figure (journal rule)
+      mtext(if (ns == 0) "(a)" else "(b)", side = 3, adj = 0, line = 0.3, font = 2)   # panel label only
+      abline(h = alpha, lty = 3)                                  # nominal level
+      for (n in N_set) for (nl in 1:2) {
+        a <- agg[agg$N == n & agg$node_sd == ns, ]; y <- a[[if (nl == 1) "rej_null1" else "rej_null2"]]
+        lines(a$delta + ifelse(n == N_set[1], -0.006, 0.006), y, type = "b", pch = if (n == N_set[1]) 16 else 17, lty = nl, col = if (nl == 1) "grey40" else "black")
+      }
+      if (ns == node_set[1]) legend("topleft", c("Null 1", "Null 2", paste("N =", N_set)), lty = c(1, 2, NA, NA),
+                                    pch = c(NA, NA, 16, 17), col = c("grey40", "black", "black", "black"), bty = "n", cex = 0.8)
+    }
+  }
+  cairo_pdf(paste0(base, ".pdf"), width = 7, height = 3.4); draw(); dev.off()
+  tiff(paste0(base, "_1600dpi.tif"), width = 7, height = 3.4, units = "in", res = 1600, compression = "lzw", type = "cairo"); draw(); dev.off()
+  png(paste0(base, "_300dpi.png"), width = 7, height = 3.4, units = "in", res = 300); draw(); dev.off()
+}
+if (!quick) save_fig("Figure_A1")                               # (plot mode also lands here)
+if (!is.null(cl)) stopCluster(cl)                                  # close worker processes
+cat("Total time (min):", round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), "\n")
 
 
 
@@ -3525,6 +3668,16 @@ cat("\n", strrep("=", 70), "\n")
 cat("COMPLETE -- Part A was read-only. Part B ADDED baseline_* columns\n")
 cat("to all panelv7_*.xlsx files (existing columns unchanged).\n")
 cat(strrep("=", 70), "\n")
+
+
+
+
+
+
+
+
+
+
 
 
 
