@@ -655,12 +655,23 @@ cat("\nPIPELINE FINISHED in", round(as.numeric(difftime(Sys.time(), t_all, units
 #       Rscript network_sim_step11.R         (full study)
 # Output: sim_step11_results.csv, sim_step11_summary.csv, Figure_A1 (pdf/tif/png)
 #       Rscript network_sim_step11.R plot    (redraw the figure from the saved summary CSV)
-# Files are written to the current working directory.
+# Tables go to <cru130>/network_paper/, figures to <cru130>/network_paper/figures/ (same as the main pipeline).
 # =============================================================================
 suppressPackageStartupMessages({ library(igraph); library(parallel) })  # graphs + Louvain; parallel loop
 
 args  <- commandArgs(trailingOnly = TRUE)                 # "quick" switches to a small pilot
 quick <- length(args) > 0 && args[1] == "quick"
+
+# ---- folders: same layout as network_pipeline.R ------------------------------
+candidate_dirs <- c("C:/Users/Alper.Tosun/Desktop/cru130",
+                    "C:/Users/autos/OneDrive/Desktop/cru130")
+base_dir <- candidate_dirs[dir.exists(candidate_dirs)][1]         # first folder that exists
+if (is.na(base_dir)) base_dir <- getwd()                          # fallback: current folder
+setwd(base_dir)
+out_dir <- file.path(base_dir, "network_paper")                   # tables (csv) go here
+fig_dir <- file.path(out_dir, "figures")                          # figures go here
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 
 # ---- design parameters ------------------------------------------------------
 N_set    <- c(60, 100)                  # number of countries (nodes)
@@ -742,7 +753,7 @@ run_par <- function(x, f) {
 plot_only <- length(args) > 0 && args[1] == "plot"      # "plot": redraw the figure from saved summary only
 t0 <- Sys.time()
 if (plot_only) {
-  agg <- read.csv("sim_step11_summary.csv")                      # reuse saved results
+  agg <- read.csv(file.path(out_dir, "sim_step11_summary.csv"))                      # reuse saved results
 } else {
 # ---- run the grid -----------------------------------------------------------
 grid <- expand.grid(N = N_set, node_sd = node_set, delta = delta_set)
@@ -759,12 +770,12 @@ res <- list(); for (i in seq_len(nrow(grid))) {
 }
 res <- do.call(rbind, res)
 tag <- if (quick) "_quick" else ""
-write.csv(res, sprintf("sim_step11_results%s.csv", tag), row.names = FALSE)
+write.csv(res, file.path(out_dir, sprintf("sim_step11_results%s.csv", tag)), row.names = FALSE)
 
 # ---- summary: rejection rates (size at delta = 0, power otherwise) and ARI ---
 res$rej_null1 <- as.numeric(res$p1 <= alpha); res$rej_null2 <- as.numeric(res$p2 <= alpha)  # reject indicators
 agg <- aggregate(cbind(rej_null1, rej_null2, ari, mod) ~ N + node_sd + delta, data = res, FUN = mean)  # means per cell
-write.csv(agg, sprintf("sim_step11_summary%s.csv", tag), row.names = FALSE)
+write.csv(agg, file.path(out_dir, sprintf("sim_step11_summary%s.csv", tag)), row.names = FALSE)
 print(agg)
 
 }
@@ -792,12 +803,9 @@ save_fig <- function(base) {
   f2 <- paste0(base, "_1600dpi.tif");  try_dev({ tiff(f2, width = 7, height = 3.4, units = "in", res = 1600, compression = "lzw"); draw(); dev.off() }, f2)   # 1600-dpi TIFF
   f3 <- paste0(base, "_300dpi.png");   try_dev({ png(f3, width = 7, height = 3.4, units = "in", res = 300); draw(); dev.off() }, f3)   # 300-dpi PNG
 }
-save_fig(if (quick) "Figure_A1_quick" else "Figure_A1")      # always draw the figure (quick run: test version)
+save_fig(file.path(fig_dir, if (quick) "Figure_A1_quick" else "Figure_A1"))      # always draw the figure (quick run: test version)
 if (!is.null(cl)) stopCluster(cl)                                  # close worker processes
 cat("Total time (min):", round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), "\n")
-
-
-
 
 
 
