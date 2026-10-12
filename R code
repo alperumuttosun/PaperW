@@ -653,7 +653,9 @@ cat("\nPIPELINE FINISHED in", round(as.numeric(difftime(Sys.time(), t_all, units
 # null-model tests applied to a noisy, node-heterogeneous, estimated network.
 # Run:  Rscript network_sim_step11.R quick   (timing pilot, ~minutes)
 #       Rscript network_sim_step11.R         (full study)
-# Output: sim_step11_results.csv, sim_step11_summary.csv, Figure_A1 (pdf/eps/tif/png)
+# Output: sim_step11_results.csv, sim_step11_summary.csv, Figure_A1 (pdf/tif/png)
+#       Rscript network_sim_step11.R plot    (redraw the figure from the saved summary CSV)
+# Files are written to the current working directory.
 # =============================================================================
 suppressPackageStartupMessages({ library(igraph); library(parallel) })  # graphs + Louvain; parallel loop
 
@@ -784,16 +786,15 @@ save_fig <- function(base) {
                                     pch = c(NA, NA, 16, 17), col = c("grey40", "black", "black", "black"), bty = "n", cex = 0.8)
     }
   }
-  cairo_pdf(paste0(base, ".pdf"), width = 7, height = 3.4); draw(); dev.off()
-  tiff(paste0(base, "_1600dpi.tif"), width = 7, height = 3.4, units = "in", res = 1600, compression = "lzw", type = "cairo"); draw(); dev.off()
-  png(paste0(base, "_300dpi.png"), width = 7, height = 3.4, units = "in", res = 300); draw(); dev.off()
+  try_dev <- function(expr, file) tryCatch({ expr; cat("Saved:", normalizePath(file), "\n") },
+                                          error = function(e) { try(dev.off(), silent = TRUE); cat("Could not write", file, ":", conditionMessage(e), "\n") })
+  f1 <- paste0(base, ".pdf");          try_dev({ cairo_pdf(f1, width = 7, height = 3.4); draw(); dev.off() }, f1)   # vector PDF
+  f2 <- paste0(base, "_1600dpi.tif");  try_dev({ tiff(f2, width = 7, height = 3.4, units = "in", res = 1600, compression = "lzw"); draw(); dev.off() }, f2)   # 1600-dpi TIFF
+  f3 <- paste0(base, "_300dpi.png");   try_dev({ png(f3, width = 7, height = 3.4, units = "in", res = 300); draw(); dev.off() }, f3)   # 300-dpi PNG
 }
-if (!quick) save_fig("Figure_A1")                               # (plot mode also lands here)
+save_fig(if (quick) "Figure_A1_quick" else "Figure_A1")      # always draw the figure (quick run: test version)
 if (!is.null(cl)) stopCluster(cl)                                  # close worker processes
 cat("Total time (min):", round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), "\n")
-
-
-
 
 
 
